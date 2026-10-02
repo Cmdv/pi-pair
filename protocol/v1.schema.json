@@ -1,0 +1,140 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "pi-pair v1 payloads (select a $defs entry for the method and direction)",
+  "$defs": {
+    "handshakeRequest": {
+      "type": "object",
+      "properties": {
+        "version": { "const": 1 },
+        "coreVersion": { "type": "string", "minLength": 1 }
+      },
+      "required": ["version", "coreVersion"],
+      "additionalProperties": false
+    },
+    "handshakeReply": {
+      "type": "object",
+      "properties": {
+        "version": { "const": 1 },
+        "editor": { "type": "string", "minLength": 1 },
+        "capabilities": { "type": "array", "items": { "type": "string", "minLength": 1 }, "uniqueItems": true },
+        "showWhenOff": { "type": "boolean", "$comment": "The developer's choice to keep pair_show_code while pairing is off; default false." }
+      },
+      "required": ["version", "editor", "capabilities"],
+      "additionalProperties": false
+    },
+    "annotateRequest": {
+      "type": "object",
+      "$comment": "Also require end_line >= start_line. The adapter validates the range in the current buffer and resolves paths within the project, including symlinks.",
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "path": {
+          "type": "string",
+          "pattern": "^(?!\\.\\.?(/|$))[^/\\\\:\\u0000-\\u001f]+(/(?!\\.\\.?(/|$))[^/\\\\:\\u0000-\\u001f]+)*(?![\\s\\S])"
+        },
+        "start_line": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
+        "end_line": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
+        "note": { "type": "string", "pattern": "\\S" },
+        "kind": { "const": "note" }
+      },
+      "required": ["id", "path", "start_line", "end_line", "note", "kind"],
+      "additionalProperties": false
+    },
+    "showRequest": {
+      "type": "object",
+      "$comment": "Temporary highlights without notes; each range also requires end_line >= start_line.",
+      "properties": {
+        "ranges": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "properties": {
+              "path": { "$ref": "#/$defs/annotateRequest/properties/path" },
+              "start_line": { "$ref": "#/$defs/annotateRequest/properties/start_line" },
+              "end_line": { "$ref": "#/$defs/annotateRequest/properties/end_line" }
+            },
+            "required": ["path", "start_line", "end_line"],
+            "additionalProperties": false
+          }
+        }
+      },
+      "required": ["ranges"],
+      "additionalProperties": false
+    },
+    "presentRequest": {
+      "type": "object",
+      "properties": {
+        "annotations": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/annotateRequest" } }
+      },
+      "required": ["annotations"],
+      "additionalProperties": false
+    },
+    "bufferStateRequest": {
+      "type": "object",
+      "properties": {
+        "paths": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/annotateRequest/properties/path" }
+        }
+      },
+      "required": ["paths"],
+      "additionalProperties": false
+    },
+    "bufferStateReply": {
+      "type": "object",
+      "$comment": "One entry per requested path, in request order. Never opens a file.",
+      "properties": {
+        "ok": { "const": true },
+        "buffers": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "path": { "type": "string" },
+              "open": { "type": "boolean" },
+              "modified": { "type": "boolean" }
+            },
+            "required": ["path", "open", "modified"],
+            "additionalProperties": false
+          }
+        }
+      },
+      "required": ["ok", "buffers"],
+      "additionalProperties": false
+    },
+    "clearRequest": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": { "ids": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "type": "string", "minLength": 1 } } },
+          "required": ["ids"],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": { "all": { "const": true } },
+          "required": ["all"],
+          "additionalProperties": false
+        }
+      ]
+    },
+    "reply": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": { "ok": { "const": true } },
+          "required": ["ok"],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": { "ok": { "const": false }, "error": { "type": "string", "minLength": 1 } },
+          "required": ["ok", "error"],
+          "additionalProperties": false
+        }
+      ]
+    }
+  }
+}

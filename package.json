@@ -1,0 +1,29 @@
+{
+  "name": "pi-pair",
+  "version": "0.1.0",
+  "description": "Pairing modes for Pi: choose who drives, and keep the working visible",
+  "keywords": ["pi-package", "pi"],
+  "license": "GPL-3.0-or-later",
+  "author": "Vincent Orr <vincent@cmdv.me>",
+  "repository": "github:Cmdv/pi-pair",
+  "type": "module",
+  "pi": {
+    "extensions": ["./src/index.ts"]
+  },
+  "files": ["src/", "protocol/", "editors/", "README.md", "LICENSE"],
+  "scripts": {
+    "test": "node --test test/*.test.ts",
+    "check": "tsc --noEmit"
+  },
+  "dependencies": {
+    "typebox": "1.3.27"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "0.87.1",
+    "@types/node": "22.19.19",
+    "typescript": "6.0.3"
+  }
+}

@@ -1,0 +1,4 @@
+node_modules/
+# Local planning: kept on disk, never published.
+.pi/
+AGENTS.md
