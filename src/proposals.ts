@@ -8,7 +8,8 @@ import { readState, stateFile, status, writeAtomic, writeState } from "./state.t
 
 const id = Type.String({ pattern: "^[0-9]+$" });
 const name = Type.String({ pattern: "^[^\\r\\n]+$", minLength: 1 });
-const sections = Type.Object(Object.fromEntries(SECTIONS.map((section) => [section, Type.Optional(Type.String())])), { additionalProperties: false, minProperties: 1 });
+const sections = Type.Object(Object.fromEntries(SECTIONS.map((section) => [section, Type.Optional(Type.String())])), { additionalProperties: false, minProperties: 1,
+	description: "Summary: 2–3 lines to review first. Questions: - [ ] Q1: text, then an indented - Options: a | b | c (up to five, recommendation first); code asks and records the answers." });
 const normalized = (text?: string) => text?.replace(/\r\n/g, "\n").trim();
 /** What a payload must be, per kind. Checked before anything is written. */
 export const writeSchema = Type.Union([

@@ -22,11 +22,11 @@ test("parses the design document's task example", () => {
 	assert.equal(task.id, "2");
 	assert.equal(task.name, "Discuss and agree a task");
 	assert.equal(task.line, 6);
-	assert.deepEqual(Object.keys(task.sections), ["Task", "Research", "Proposed solution", "Questions", "Edge cases", "Done when"]);
+	assert.deepEqual(Object.keys(task.sections), ["Summary", "Task", "Research", "Proposed solution", "Questions", "Edge cases", "Done when"]);
 	assert.equal(task.sections.Task?.text, "Problem, intended outcome, scope and constraints.");
 	assert.equal(task.sections["Done when"]?.text, "Observable outcomes and checks that demonstrate the task is finished.");
 	assert.deepEqual(task.questions.map(({ id, checked, text, fields }) => [id, checked, text, fields]),
-		[["Q1", true, "Does approving this task start implementation?", { Answer: "No. Spec only records agreement." }]]);
+		[["Q1", true, "Does approving this task start implementation?", { Options: "No, record agreement only | Yes, implement immediately", Answer: "No. Spec only records agreement." }]]);
 	assert.deepEqual(task.edges.map(({ id, checked, fields }) => [id, checked, fields]), [
 		["E1", true, { Expected: "Refuse the stale approval and ask for a fresh proposal.", Check: "Edit the task after publishing; approving must not overwrite it." }],
 		["E2", false, {}],
@@ -160,11 +160,11 @@ test("creates specs, sets the goal and appends tasks with fresh IDs", () => {
 	assert.equal(parseSpec(withGoal).goal, "Stay connected.\nAcross sleep.");
 	const { text, ids } = appendTasks(withGoal, ["Detect sleep", "Back off"]);
 	assert.deepEqual(ids, ["1", "2"]);
-	const sections = "### Task\n\n### Research\n\n### Proposed solution\n\n### Questions\n\n### Edge cases\n\n### Done when\n";
+	const sections = "### Summary\n\n### Task\n\n### Research\n\n### Proposed solution\n\n### Questions\n\n### Edge cases\n\n### Done when\n";
 	assert.equal(text, `${withGoal}\n## 1: Detect sleep\n\n${sections}\n## 2: Back off\n\n${sections}`);
 	const spec = parseSpec(text);
 	assert.deepEqual(spec.problems, []);
-	assert.deepEqual(spec.tasks.map((task) => [task.id, task.name, Object.keys(task.sections).length]), [["1", "Detect sleep", 6], ["2", "Back off", 6]]);
+	assert.deepEqual(spec.tasks.map((task) => [task.id, task.name, Object.keys(task.sections).length]), [["1", "Detect sleep", 7], ["2", "Back off", 7]]);
 	assert.equal(nextTaskId(spec), "3");
 	assert.equal(nextTaskId(spec, ["7", "other"]), "8"); // IDs the state still knows are not reused.
 	assert.deepEqual(appendTasks(text, ["Third"], ["5"]).ids, ["6"]);
@@ -173,7 +173,7 @@ test("creates specs, sets the goal and appends tasks with fresh IDs", () => {
 	// A spec without a Goal section gets one after the title; filling an appended task replaces only its blank body.
 	assert.equal(setGoal("# Bare\n\n## 1: One\n", "G."), "# Bare\n\n## Goal\nG.\n\n## 1: One\n");
 	assert.equal(setGoal("## 1: One\n", "G."), "## Goal\nG.\n\n## 1: One\n");
-	assert.match(updateTask(text, "2", { sections: { Task: "Wait longer." } }), /## 2: Back off\n\n### Task\nWait longer\.\n\n### Research\n/);
+	assert.match(updateTask(text, "2", { sections: { Task: "Wait longer." } }), /## 2: Back off\n\n### Summary\n\n### Task\nWait longer\.\n\n### Research\n/);
 });
 
 test("the order is a top-level section after the goal: advice on the sequence, which reopens no task", () => {

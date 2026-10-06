@@ -23,6 +23,7 @@ function harness(t: { after: (fn: () => void) => void }, editor?: (method: strin
 	const tools = new Map<string, any>();
 	const entries: any[] = [];
 	const messages: any[] = [];
+	const userMessages: string[] = [];
 	const history: any[] = [];
 	const notices: string[] = [];
 	const widgets: (string[] | undefined)[] = [];
@@ -41,6 +42,7 @@ function harness(t: { after: (fn: () => void) => void }, editor?: (method: strin
 		registerTool: (tool: any) => tools.set(tool.name, tool), registerMessageRenderer() {},
 		getActiveTools: () => active, setActiveTools: (names: string[]) => { active = names; },
 		appendEntry: (customType: string, data: any) => entries.push({ type: "custom", id: String(entries.length), customType, data }),
+		sendUserMessage: (text: string) => { userMessages.push(text); },
 		sendMessage: (message: any, options: any) => {
 			messages.push({ message, options });
 			if (options?.triggerTurn) deliver({ role: "custom", ...message, timestamp: ++timestamp });
@@ -66,8 +68,8 @@ function harness(t: { after: (fn: () => void) => void }, editor?: (method: strin
 		newSession: async (options: any) => { sessions.push(options); return { cancelled: false }; },
 	} as unknown as ExtensionCommandContext;
 	const command = (name: string, args = "") => commands.get(name).handler(args, ctx);
-	const turn = async (text = "Discuss the selected task.") => {
-		const input = await emit("input", { text, source: "rpc" });
+	const turn = async (text = "Discuss the selected task.", source = "rpc") => {
+		const input = await emit("input", { text, source });
 		if (input?.action === "handled") return { input };
 		const prompt = await emit("before_agent_start", { prompt: text, systemPrompt: "base" });
 		deliver({ role: "user", content: [{ type: "text", text }], timestamp: ++timestamp });
@@ -80,7 +82,7 @@ function harness(t: { after: (fn: () => void) => void }, editor?: (method: strin
 	const pick = (match: string) => { ui.select = async (_title, options) => options.find((option) => option.startsWith(match)); };
 	// Rows are unnumbered: the list is in task order, so task N is row N, and only the list answers.
 	const choose = async (id = "1") => { ui.select = async (title, options) => title.startsWith("Spec tasks") ? options[Number(id) - 1] : undefined; await command("pair:tasks"); };
-	return { cwd, file, ctx, ui, entries, messages, notices, statuses, widgets, sessions, tools, history, asked,
+	return { cwd, file, ctx, ui, entries, messages, userMessages, notices, statuses, widgets, sessions, tools, history, asked,
 		emit, deliver, turn, write, gate, context, command, choose, pick,
 		hash: (id = "1") => loadSpec(file).parsed.tasks.find((task) => task.id === id)!.hash,
 		spec: () => loadSpec(file), answers: (fn: typeof answer) => { answer = fn; },
@@ -173,80 +175,116 @@ test("the start is linear: ask the problem, write the whole spec, open the fille
 	h.ui.select = async (_title, options) => { offered = options; return undefined; };
 	await h.settle();
 	assert.equal(calls.filter((name) => name === "open").length, 1);
-	assert.deepEqual(offered, ["Backoff · written · 1 open", "Report · written · 1 open", "+ New task", "Cancel"]);
+	assert.deepEqual(offered, ["Backoff · written · 1 open", "Report · written · 1 open", "+ New task", "Describe changes…", "Cancel"]);
 	assert.equal(h.widgets.at(-1)?.length, 1); // One line of shortcuts, never two.
 	assert.deepEqual(h.widgets.at(-1), ["/pair:tasks Tasks · /pair off Stop"]);
 });
 
-test("an empty task is filled in, then its questions go to the developer through pair_ask", async (t) => {
+test("a filled task opens on its summary and choices, not automatic questions or another model turn", async (t) => {
 	const h = harness(t);
 	await h.init();
 	await h.write({ kind: "tasks", goal: "Stay up.", names: ["Backoff"] });
 	h.ui.select = async (_title, options) => options[0];
 	await h.settle();
-
-	// Steps 9 and 10: choosing an empty task asks the model to fill it in, under a contract scoped to that task.
 	assert.match(h.messages.at(-1).message.content, /^Fill in task 1: Backoff\.$/);
 	assert.equal(h.messages.at(-1).options.triggerTurn, true);
 	assert.match((await h.turn("anything")).message.content, /"phase": "populate"/);
 	assert.equal(h.gate("pair_write", { kind: "task", id: "2" }).block, true);
-	// However the model phrases them, questions are saved as items, so code can count what is still open.
-	await h.write(taskWrite(h, "1", { ...SECTIONS, Questions: "1. Fixed or exponential?\n2. Cap the total wait?" }));
-	assert.deepEqual(h.spec().parsed.tasks[0].questions.map((item) => [item.id, item.checked, item.text]),
-		[["Q1", false, "Fixed or exponential?"], ["Q2", false, "Cap the total wait?"]]);
-
-	// Step 11: a written task with open questions does not reach review; the model is sent to ask them.
-	await h.settle();
-	assert.deepEqual(h.asked, []); // Their own dialog, with likely answers, not a bare prompt.
-	const asking = h.messages.at(-1);
-	assert.match(asking.message.content, /^Task 1 has 2 open questions\. Put them to the developer now with pair_ask/);
-	assert.match(asking.message.content, /Q1: Fixed or exponential\?\nQ2: Cap the total wait\?$/);
-	assert.equal(asking.options.triggerTurn, true);
-
-	// Step 12: the model records what they said; a question left open keeps the task in review.
-	await h.write(taskWrite(h, "1", { Questions: "- [x] Q1: Fixed or exponential?\n  - Answer: Exponential.\n- [ ] Q2: Cap the total wait?", "Proposed solution": "Wait exponentially." }));
-	let review: [string, string[]] | undefined;
-	h.ui.select = async (title, options) => { review = [title, options]; return "Discuss or adjust"; };
-	await h.settle();
-	const questions = h.spec().parsed.tasks[0].questions;
-	assert.deepEqual(questions.map((item) => [item.id, item.checked, item.fields.Answer]), [["Q1", true, "Exponential."], ["Q2", false, undefined]]);
-	// Step 13: review offers the two things left to do; talking first gets a prompt, on its own line.
-	assert.deepEqual(review, ["Task 1: Backoff", ["Agree", "Discuss or adjust"]]);
-	assert.match(h.messages.at(-1).message.content, /^Task 1: Backoff is written\.\nAnything to discuss or adjust\?$/);
-	assert.deepEqual(h.widgets.at(-1), ["/pair:approve Approve task · /pair:tasks Tasks · /pair off Stop"]);
-	// Questions are put once, however often the task is rewritten.
-	await h.write(taskWrite(h, "1", { "Done when": "Retries are bounded." }));
-	await h.settle();
-	assert.equal(h.messages.filter((entry: any) => /with pair_ask/.test(entry.message.content)).length, 1);
+	await h.write(taskWrite(h, "1", { ...SECTIONS, Summary: "Retry with a growing delay.",
+		Questions: "- [ ] Q1: Fixed or exponential?\n  - Options: fixed | exponential\n- [ ] Q2: Cap the total wait?" }));
+	assert.deepEqual(h.spec().parsed.tasks[0].questions.map(({ id, checked, text, fields }) => [id, checked, text, fields]),
+		[["Q1", false, "Fixed or exponential?", { Options: "fixed | exponential" }], ["Q2", false, "Cap the total wait?", {}]]);
+	const count = h.messages.length;
+	let menu: [string, string[]] | undefined;
+	h.ui.select = async (title, options) => { menu = [title, options]; return "obsolete choice"; };
+	await h.settle(); // Unknown choices must dismiss rather than loop into an empty question list.
+	assert.deepEqual(menu, ["Task 1: Backoff · written · 3 open\n\nRetry with a growing delay.",
+		["Answer 2 open questions", "Agree", "Describe changes…", "Back to the list"]]);
+	assert.deepEqual(h.asked, []);
+	assert.equal(h.messages.length, count);
+	assert.equal(h.spec().view.agreed, 0);
 });
 
-test("answering every question agrees the task and returns to the list", async (t) => {
+test("code records written questions' answers; all answered agrees, partial answers return to the task", async (t) => {
+	for (const partial of [false, true]) {
+		const questions: any[] = [];
+		const h = harness(t, (method, args) => {
+			if (method === "handshake") return { version: 1, editor: "test", capabilities: ["buffer_state", "ask"] };
+			if (method === "ask") {
+				questions.push(...args.questions);
+				return { ok: true, answers: [{ answer: "fixed", typed: false }, partial ? null : { answer: "30 seconds", typed: true }] };
+			}
+			return { ok: true, buffers: args.paths.map((path: string) => ({ path, open: false, modified: false })) };
+		});
+		h.start(); await h.init();
+		writeFileSync(h.file, SPEC.replace("### Task\nRetry.", "### Summary\nRetry safely.\n### Task\nRetry.\n### Questions\n"
+			+ "- [ ] Q1: Fixed or exponential?\n  - Options: fixed | exponential\n- [ ] Q2: Cap the total wait?"));
+		let visits = 0;
+		let menu: [string, string[]] | undefined;
+		h.ui.select = async (title, options) => {
+			menu = [title, options];
+			if (title.startsWith("Spec tasks")) return visits++ ? undefined : options[0];
+			return options.includes("Answer 2 open questions") ? "Answer 2 open questions" : undefined;
+		};
+		await h.command("pair:tasks");
+		assert.deepEqual(questions, [{ label: "Q1", question: "Fixed or exponential?", options: ["fixed (recommended)", "exponential"] },
+			{ label: "Q2", question: "Cap the total wait?", options: [] }]);
+		assert.deepEqual(h.spec().parsed.tasks[0].questions.map(({ checked, fields }) => [checked, fields.Answer]),
+			[[true, "fixed"], [!partial, partial ? undefined : "30 seconds"]]);
+		assert.equal(h.factoryCalls(), 0);
+		if (partial) {
+			assert.equal(h.spec().view.agreed, 0);
+			assert.match(h.messages.at(-1).message.content, /1 still open/);
+			assert.match(menu![0], /^Task 1: Backoff/);
+			assert.equal(menu![1][0], "Answer 1 open question");
+		} else {
+			assert.equal(h.spec().state.tasks["1"].agreedHash, h.hash("1"));
+			assert.match(h.messages.at(-1).message.content, /^Task 1: Backoff approved\.$/);
+			assert.deepEqual(menu![1], ["Backoff · agreed", "Report · written", "+ New task", "Describe changes…", "Approve spec", "Cancel"]);
+		}
+	}
+});
+
+test("typed changes are user messages, skip triage, and return to the task or list after the turn", async (t) => {
 	const h = harness(t);
-	await h.init();
-	writeFileSync(h.file, SPEC.replace("## 1: Backoff\n### Task\nRetry.", "## 1: Backoff\n### Task\nRetry.\n### Questions\n- [ ] Q1: Fixed or exponential?"));
-	await h.choose("1");
-	// Step 11: a written task opens on its own questions, with no model turn to decide that.
-	assert.match(h.messages.at(-1).message.content, /^Task 1 has an open question\. Put it to the developer now with pair_ask/);
-	assert.equal(h.messages.at(-1).options.triggerTurn, true);
+	await h.init(true);
+	for (const selected of [true, false]) {
+		h.ui.select = async (title, options) => title.startsWith("Spec tasks") && selected ? options[0] : "Describe changes…";
+		h.answers(() => "make the delay longer");
+		await h.command("pair:tasks");
+		assert.equal(h.userMessages.at(-1), "make the delay longer");
+		const prompt = await h.turn(h.userMessages.at(-1)!, "extension");
+		assert.equal(h.factoryCalls(), 0);
+		assert.match(prompt.message.content, /"developerWants": "edit"/);
+		assert.match(prompt.message.content, selected ? /"write": "task"/ : /"write": "any"/);
+		if (!selected) {
+			assert.ok(prompt.message.content.includes("## 2: Report")); // Cross-task edits carry the content; reading the spec is forbidden.
+			await h.write(taskWrite(h, "2", { Task: "Report retries too." }));
+		}
+		await h.write(taskWrite(h, "1", { Task: "Retry with a longer delay." }));
+		let title = "";
+		h.ui.select = async (heading) => { title = heading; return undefined; };
+		await h.settle();
+		assert.match(title, selected ? /^Task 1: Backoff/ : /^Spec tasks/);
+	}
+});
 
-	// Step 13: answering them is the developer deciding the task, so the answers landing agree it.
-	let offered: string[] = [];
-	h.ui.select = async (_title, options) => { offered = options; return options.includes("Discuss or adjust") ? "Discuss or adjust" : undefined; };
-	await h.write(taskWrite(h, "1", { Questions: "- [x] Q1: Fixed or exponential?\n  - Answer: Exponential." }));
-	await h.settle();
-	assert.deepEqual([h.spec().view.agreed, h.spec().state.tasks["1"].agreedHash], [1, h.hash("1")]);
-	assert.match(h.messages.at(-1).message.content, /^Task 1: Backoff approved\.$/);
-	assert.deepEqual(offered, ["Backoff · agreed", "Report · written", "+ New task", "Approve spec", "Cancel"]);
-
-	// A turn that brings back no answers still leaves the developer somewhere: review, not silence.
-	writeFileSync(h.file, readFileSync(h.file, "utf8").replace("## 2: Report\n### Task", "## 2: Report\n### Questions\n- [ ] Q1: Which log?\n### Task"));
-	await h.choose("2");
-	assert.match(h.messages.at(-1).message.content, /^Task 2 has an open question\./);
-	h.ui.select = async (_title, options) => { offered = options; return "Discuss or adjust"; };
-	await h.settle();
-	assert.deepEqual(offered, ["Agree", "Discuss or adjust"]);
-	assert.match(h.messages.at(-1).message.content, /^Task 2: Report is written\.\nAnything to discuss or adjust\?$/);
-	assert.equal(h.spec().state.tasks["2"], undefined); // Skipped questions agree nothing.
+test("old specs fall back to the first Task paragraph; RPC titles also carry the full task", async (t) => {
+	for (const rpc of [false, true]) {
+		const h = harness(t);
+		await h.init(true);
+		if (rpc) h.ctx.mode = "rpc";
+		writeFileSync(h.file, SPEC.replace("Retry.", "Retry.\n\nLonger details."));
+		let title = "";
+		h.ui.select = async (heading, options) => {
+			if (heading.startsWith("Spec tasks")) return options[0];
+			title = heading; return undefined;
+		};
+		await h.command("pair:tasks");
+		assert.match(title, /^Task 1: Backoff · written\n\nRetry\./);
+		assert.equal(title.includes("\n---\n## 1: Backoff"), rpc);
+		assert.equal(title.includes("Longer details."), rpc);
+	}
 });
 
 test("approving a task returns to the list, where one agreed task makes the spec approvable", async (t) => {
@@ -261,7 +299,7 @@ test("approving a task returns to the list, where one agreed task makes the spec
 	assert.equal(h.spec().view.ready, false); // Approving a task is not approving the spec.
 	assert.match(h.messages.at(-1).message.content, /^Task 1: Backoff approved\.$/);
 	// Step 17: back to the list, which now offers the spec.
-	assert.deepEqual(offered, ["Backoff · agreed", "Report · written", "+ New task", "Approve spec", "Cancel"]);
+	assert.deepEqual(offered, ["Backoff · agreed", "Report · written", "+ New task", "Describe changes…", "Approve spec", "Cancel"]);
 	assert.deepEqual(h.widgets.at(-1), ["/pair:approve Approve spec · /pair:tasks Tasks · /pair off Stop"]);
 
 	// Step 13 again, from the review dialog this time: 2 has no questions, so Agree is right there.
@@ -340,7 +378,7 @@ test("review messages are triaged: the scope widens the turn, and the list is re
 	let offered: string[] = [];
 	list.ui.select = async (_title, options) => { offered = options; return undefined; };
 	assert.deepEqual(await list.emit("input", { text: "take me back to the tasks", source: "rpc" }), { action: "handled" });
-	assert.deepEqual(offered, ["Backoff · written", "Report · written", "+ New task", "Cancel"]);
+	assert.deepEqual(offered, ["Backoff · written", "Report · written", "+ New task", "Describe changes…", "Cancel"]);
 	assert.equal(list.statuses.at(-1), "🧑‍🤝‍🧑 Spec: flow");
 });
 

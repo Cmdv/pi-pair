@@ -48,7 +48,7 @@ test("Emacs schema conformance and real core RPC handshake/clear, without a mode
 	}
 	// A valid ask waits for the developer, so only rejections replay here.
 	const question = { label: "Scope", question: "Which files?", options: ["src", "all"] };
-	for (const questions of [[], Array(6).fill(question), [{ ...question, label: "A label far too long" }], [{ ...question, options: ["src"] }], [{ ...question, extra: true }]]) {
+	for (const questions of [[], Array(6).fill(question), [{ ...question, label: "A label far too long" }], [{ ...question, options: Array(6).fill("src") }], [{ ...question, extra: true }]]) {
 		cases.push({ method: "ask", args: { questions }, valid: false, count: 3 });
 	}
 	for (const args of [{}, { all: false }, { all: null }, { ids: [] }, { ids: ["one", "one"] }, { ids: ["one", 42] }, { ids: ["one"], all: true }]) {

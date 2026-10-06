@@ -35,6 +35,13 @@ test("each question offers its options plus Other, which asks for typed text", a
 	assert.equal(answerText(questions, answers), "Public or private?\n→ Public\n\nWhich licence?\n→ AGPL (typed by the developer)\n\nnpm too?\n→ No");
 });
 
+test("code-built questions without options go straight to typed input", async () => {
+	const fake = ui("  30 seconds  ");
+	const answers = await askEach(fake, [{ label: "Cap", question: "How long?", options: [] }]);
+	assert.deepEqual(fake.offered, [["How long?", "Your answer", { signal: undefined }]]);
+	assert.deepEqual(answers, [{ answer: "30 seconds", typed: true }]);
+});
+
 test("dismissing a question, or an empty Other, stops asking", async () => {
 	const partial = await askEach(ui("Public", undefined), questions);
 	assert.deepEqual(partial, [{ answer: "Public", typed: false }, null, null]);

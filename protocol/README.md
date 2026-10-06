@@ -112,7 +112,9 @@ contracts. Control actions are not inferred from conversational replies.
 ## Ask
 
 `ask` accepts `{"questions":[{"label":"Scope","question":"Which files?","options":["src","all"]}]}`:
-one to five questions, each with a short tab label and two to five options.
+one to five questions, each with a short tab label and zero to five options.
+With no options the developer types an answer; `pair_ask` still requires two
+or more options for model-generated questions.
 The first option is the model's recommendation and arrives labelled as such;
 show the options in the order given.  Show a tab per question and a final
 Submit tab; the developer moves between them freely, picks an option or types

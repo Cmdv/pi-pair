@@ -33,7 +33,8 @@ export type Answers = (Answer | null)[];
 export async function askEach(ui: Pick<ExtensionUIContext, "select" | "input">, questions: Question[], signal?: AbortSignal): Promise<Answers> {
 	const answers: Answers = questions.map(() => null);
 	for (const [i, { question, options }] of questions.entries()) {
-		const choice = await ui.select(question, [...labelled(options), OTHER], { signal });
+		// A question written without options is simply typed into.
+		const choice = options.length ? await ui.select(question, [...labelled(options), OTHER], { signal }) : OTHER;
 		const typed = choice === OTHER;
 		const answer = typed ? (await ui.input(question, "Your answer", { signal }))?.trim() : choice && chosen(choice);
 		if (!answer) break;

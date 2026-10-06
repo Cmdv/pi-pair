@@ -2,15 +2,15 @@ import { appendFileSync, existsSync, mkdirSync, readdirSync, writeFileSync } fro
 import { join, resolve, sep } from "node:path";
 import { withFileMutationQueue, type ExtensionAPI, type ExtensionCommandContext, type ExtensionContext, type MessageStartEvent } from "@earendil-works/pi-coding-agent";
 import { Box, Spacer, Text } from "@earendil-works/pi-tui";
-import { findTask, slug, template } from "./tasks.ts";
-import { emptyState, stateFile, writeState, type Status } from "./state.ts";
+import { answeredQuestions, findTask, optionsOf, slug, summaryOf, template } from "./tasks.ts";
+import { emptyState, stateFile, writeState, type Status, type TaskStatus } from "./state.ts";
 import { apply, loadSpec as loadFile, save, writeParameters } from "./proposals.ts";
 import { classifierFactory, type Classifier, type ClassifierFactory } from "./classifier.ts";
 import { allowsWrite, CONTRACT, contractFor, guidance, READ_TOOLS, WRITE, type Contract, type Intent } from "./contracts.ts";
 import { triage, writeScope } from "./triage.ts";
 import { ask as askEditor, bufferState, handshake, open as openEditor, rpcTransport } from "./adapter.ts";
 import { NEEDS, SHOW_CODE, registerShow, type Connected } from "./show.ts";
-import { answerText, askEach, askParameters, askTabs, type Answers } from "./ask.ts";
+import { answerText, askEach, askParameters, askTabs, type Answers, type Question } from "./ask.ts";
 import pkg from "../package.json" with { type: "json" };
 
 const ENTRY = "pi-pair";
@@ -23,10 +23,11 @@ const PAIR_NO_SPEC = "Pair no spec";
 const NEW_SPEC = "New spec";
 const EDIT_SPEC = "Edit spec";
 const NEW_TASK = "+ New task";
+const DESCRIBE = "Describe changes…";
+const BACK = "Back to the list";
 const APPROVE_SPEC = "Approve spec";
 const KEEP_WORKING = "Keep working on the tasks";
 const AGREE = "Agree";
-const ADJUST = "Discuss or adjust";
 const IMPLEMENT = "Implement task";
 const IMPLEMENT_PROMPT = "Implement task + prompt";
 const MARK_DONE = "Mark task as done";
@@ -42,7 +43,7 @@ const messageText = (message: Message) => "content" in message ? typeof message.
 const strings = (value: unknown): string[] =>
 	typeof value === "string" ? [value] : value && typeof value === "object" ? Object.values(value).flatMap(strings) : [];
 /** What code does once the model's turn has settled; derived from what was written, so repeated writes agree. */
-type Next = "tasks" | "questions" | "review" | "agree";
+type Next = "tasks" | "task";
 
 /** Pair is on or off, with an optional spec. PI_PAIR_EDITOR separately opts into adapter discovery. */
 export default function (pi: ExtensionAPI, factory: ClassifierFactory = classifierFactory) {
@@ -51,11 +52,10 @@ export default function (pi: ExtensionAPI, factory: ClassifierFactory = classifi
 	let selection: string | undefined; // The task being filled in or reviewed; none means the task list.
 	let intent: Intent | undefined; // The last triage result, which scopes what the model may write.
 	let next: Next | undefined;
+	let requested: string | undefined; // A change request from our dialog is already scoped; do not triage it again.
 	let revision = 0; // Any scope change invalidates a picker or dialog that is already open.
 	let classifier: Classifier | undefined;
 	let classifierFailed = false;
-	const asked = new Set<string>(); // Tasks whose questions have already been put to the developer.
-	let answering: string | undefined; // The task whose answers code is waiting for; answering it agrees it.
 	let ready = false; // The spec is approved: Pair works on it, and the spec machinery stands down.
 	let traced: string | undefined; // The session the trace log is on, so separate runs read apart.
 	let adapter: Promise<Connected | undefined> = Promise.resolve(undefined);
@@ -121,10 +121,10 @@ export default function (pi: ExtensionAPI, factory: ClassifierFactory = classifi
 
 	function setPair(on: boolean, name: string | undefined, ctx: ExtensionContext) {
 		revision++;
-		if (spec !== name || !on) { selection = undefined; asked.clear(); }
+		if (spec !== name || !on) selection = undefined;
 		intent = undefined;
 		next = undefined;
-		answering = undefined;
+		requested = undefined;
 		pair = on;
 		spec = name;
 		pi.appendEntry(ENTRY, { pair, spec, selection });
@@ -229,11 +229,7 @@ export default function (pi: ExtensionAPI, factory: ClassifierFactory = classifi
 			if (!pair) throw new Error("Pairing is off.");
 			if (!ctx.hasUI) throw new Error("No dialogs available; ask in chat instead.");
 			const { questions } = params;
-			const editor = ctx.mode === "rpc" ? await adapter : undefined;
-			const answers = ctx.mode === "tui" ? await askTabs(ctx.ui, questions, signal)
-				: editor?.capabilities.has("ask")
-					? await askEditor(editor.send, questions, signal ? AbortSignal.any([signal, editor.signal]) : editor.signal)
-					: await askEach(ctx.ui, questions, signal);
+			const answers = await askDeveloper(ctx, questions, signal);
 			return { content: [{ type: "text", text: answerText(questions, answers) }], details: { answers } };
 		},
 	});
@@ -277,11 +273,8 @@ export default function (pi: ExtensionAPI, factory: ClassifierFactory = classifi
 			}
 			show(ctx);
 			const task = selection ? written.view.tasks.find((item) => item.id === selection) : undefined;
-			const unanswered = selection ? openQuestions(ctx, selection).length : 0;
-			// Answering a task's questions is the developer's decision on it, so the answers landing agree it.
-			next = !selection ? "tasks" : !task?.populated ? undefined
-				: selection === answering ? unanswered ? "review" : "agree"
-					: unanswered && !asked.has(selection) ? "questions" : "review";
+			// Once the turn settles, the list comes back after drafting, and a task comes back once it is written.
+			next = !selection ? "tasks" : task?.populated ? "task" : undefined;
 			return { content: [{ type: "text" as const, text: `Saved ${summary}.` }], details: { summary } };
 		},
 	});
@@ -292,33 +285,87 @@ export default function (pi: ExtensionAPI, factory: ClassifierFactory = classifi
 	const openQuestions = (ctx: ExtensionContext, id: string) =>
 		findTask(loadSpec(ctx.cwd).parsed, id)?.questions.filter((item) => !item.checked) ?? [];
 
-	/** Step 11: a task's own questions reach the developer when they open it, through
-	 * pair_ask's dialog, so each one comes with likely answers and a recommendation. */
-	function askQuestions(ctx: ExtensionContext): Promise<void> | void {
-		const id = selection;
-		if (!id) return;
-		const open = ctx.hasUI ? openQuestions(ctx, id) : [];
-		if (!open.length) return reviewPrompt(ctx);
-		asked.add(id);
-		answering = id;
-		trace(ctx, "asking", { task: id, questions: open.map((item) => item.id) });
-		const one = open.length === 1;
-		// Step 12: the model asks, then folds the answers back into the task.
-		say(`Task ${id} has ${one ? "an open question" : `${open.length} open questions`}. Put ${one ? "it" : "them"} to the developer now with pair_ask, `
-			+ `each with likely answers and your recommendation first. Then record what they say in task ${id} with pair_write, ticking the questions you answered, and stop; answering them agrees the task.\n\n`
-			+ open.map((item) => `${item.id}: ${item.text}`).join("\n"), true, { task: id });
+	/** A task's standing, as the list and its own dialog both put it. */
+	const label = (task: TaskStatus) => `${task.agreed ? "agreed" : task.populated ? "written" : "empty"}${task.open ? ` · ${task.open} open` : ""}`;
+
+	/** Questions go to the editor's tabbed dialog when it has one, else Pi's own tabs, else one dialog at a time. */
+	async function askDeveloper(ctx: ExtensionContext, questions: Question[], signal?: AbortSignal): Promise<Answers> {
+		const editor = ctx.mode === "rpc" ? await adapter : undefined;
+		if (editor?.capabilities.has("ask")) return askEditor(editor.send, questions, signal ? AbortSignal.any([signal, editor.signal]) : editor.signal);
+		if (ctx.mode === "tui" && typeof ctx.ui.custom === "function") return askTabs(ctx.ui, questions, signal);
+		return askEach(ctx.ui, questions, signal);
 	}
 
-	/** Step 13: the task is written and had nothing to ask; the developer agrees it, or talks about it first. */
-	async function reviewPrompt(ctx: ExtensionContext): Promise<void> {
-		const task = selection ? loadSpec(ctx.cwd).view.tasks.find((item) => item.id === selection) : undefined;
-		if (!task) return;
+	/** Step 11: the task's open questions, put by code from what the model wrote, each with its options and the
+	 * recommendation first. Answering every one is the developer's decision on the task, so it agrees it. */
+	async function answerTask(ctx: ExtensionContext, before: number): Promise<void> {
+		const id = selection!;
+		const original = findTask(loadSpec(ctx.cwd).parsed, id)!;
+		const open = original.questions.filter((item) => !item.checked).slice(0, 5);
+		trace(ctx, "asking", { task: id, questions: open.map((item) => item.id) });
+		const answers = await askDeveloper(ctx, open.map((item) => ({ label: item.id, question: item.text, options: optionsOf(item) })));
+		if (revision !== before || selection !== id) return;
+		const given: Record<string, string> = {};
+		open.forEach((item, i) => { const answer = answers[i]; if (answer) given[item.id] = answer.answer; });
+		// Dismissing the questions decides nothing, and leaves nothing on screen.
+		if (!Object.keys(given).length) return;
+		const file = specFile(ctx.cwd)!;
+		let agreed = false;
+		await withFileMutationQueue(file, async () => {
+			await requireSaved(ctx);
+			const snapshot = loadFile(file);
+			const task = findTask(snapshot.parsed, id);
+			if (!task) throw new Error(`The spec has no task ${id}.`);
+			save(file, snapshot, apply(snapshot, { kind: "task", id, baseHash: original.hash, sections: { Questions: answeredQuestions(task, given) } }));
+			const written = loadFile(file);
+			const updated = findTask(written.parsed, id)!;
+			agreed = updated.questions.every((item) => item.checked);
+			if (agreed) {
+				written.state.tasks[id] = { agreedHash: updated.hash, completedHash: null };
+				writeState(stateFile(file), written.state);
+			}
+		});
+		trace(ctx, "answered", { task: id, answers: given, agreed });
+		announce(agreed ? `Task ${id}: ${original.name} approved.` : `Answers recorded for task ${id}; ${openQuestions(ctx, id).length} still open.`);
+		return agreed ? showTasks(ctx) : taskMenu(ctx);
+	}
+
+	/** Steps 12 and 13: a written task opens on its summary, with whatever is left to do about it. */
+	async function taskMenu(ctx: ExtensionContext): Promise<void> {
+		const id = selection;
+		if (!id) return;
+		const { text, parsed, view } = loadSpec(ctx.cwd);
+		const task = view.tasks.find((item) => item.id === id);
+		if (!task?.populated) return;
 		show(ctx);
 		const before = revision;
-		const choice = await ctx.ui.select(`Task ${task.id}: ${task.name}`, [AGREE, ADJUST]);
-		if (revision !== before || selection !== task.id) return;
+		const open = openQuestions(ctx, id).length;
+		const answer = open ? `Answer ${open} open question${open === 1 ? "" : "s"}` : undefined;
+		const detail = findTask(parsed, id)!;
+		let title = `Task ${id}: ${task.name} · ${label(task)}\n\n${summaryOf(detail)}`;
+		// The frontend folds the full task at the thematic break, without another RPC request.
+		if (ctx.mode === "rpc") title += `\n---\n${text.split("\n").slice(detail.start, detail.end).join("\n").trim()}`;
+		const choice = await ctx.ui.select(title, [...(answer ? [answer] : []), ...(task.agreed ? [] : [AGREE]), DESCRIBE, BACK]);
+		if (revision !== before || selection !== id || choice === undefined) return;
 		if (choice === AGREE) return approve(ctx);
-		if (choice === ADJUST) announce(`Task ${task.id}: ${task.name} is written.\nAnything to discuss or adjust?`);
+		if (choice === DESCRIBE) return describeChanges(ctx);
+		if (choice === BACK) return showTasks(ctx);
+		if (choice === answer) return answerTask(ctx, before);
+	}
+
+	/** The developer's own words, typed where they are and sent as their message; the list, or the task, comes back
+	 * once the turn settles. What the model may write follows from where they typed: the list, or the one task. */
+	async function describeChanges(ctx: ExtensionContext): Promise<void> {
+		const before = revision;
+		const id = selection;
+		const text = (await ctx.ui.input("Describe changes", "What to change; it may span several tasks"))?.trim();
+		if (revision !== before || selection !== id) return;
+		if (!text) return id ? taskMenu(ctx) : showTasks(ctx);
+		intent = { scope: id ? "task" : "any", operation: "edit" };
+		next = id ? "task" : "tasks";
+		requested = text;
+		trace(ctx, "requested", { text });
+		pi.sendUserMessage(text);
 	}
 
 	/** Steps 8 and 17: the task list, which is also where the spec itself is approved. */
@@ -326,7 +373,6 @@ export default function (pi: ExtensionAPI, factory: ClassifierFactory = classifi
 		if (!pair || !spec) throw new Error("Pick a spec with /pair first.");
 		const before = revision;
 		intent = undefined;
-		answering = undefined;
 		// The list is the hub, so the spec itself is in view whenever it is open.
 		await openSpec(ctx);
 		if (revision !== before) return;
@@ -342,11 +388,11 @@ export default function (pi: ExtensionAPI, factory: ClassifierFactory = classifi
 			if (revision !== before || choice === undefined) return;
 			if (choice === APPROVE_SPEC) return approve(ctx);
 		}
-		const options = view.tasks.map((task) =>
-			`${task.name} · ${task.agreed ? "agreed" : task.populated ? "written" : "empty"}${task.open ? ` · ${task.open} open` : ""}`);
-		const choice = await ctx.ui.select(`Spec tasks · ${spec}`, [...options, NEW_TASK, ...(view.approvable ? [APPROVE_SPEC] : []), CANCEL]);
+		const options = view.tasks.map((task) => `${task.name} · ${label(task)}`);
+		const choice = await ctx.ui.select(`Spec tasks · ${spec}`, [...options, NEW_TASK, DESCRIBE, ...(view.approvable ? [APPROVE_SPEC] : []), CANCEL]);
 		if (revision !== before || choice === undefined || choice === CANCEL) return;
 		if (choice === APPROVE_SPEC) return approve(ctx);
+		if (choice === DESCRIBE) return describeChanges(ctx);
 		if (choice === NEW_TASK) {
 			const name = (await ctx.ui.input("New task", "e.g. Reconnect after sleep"))?.trim();
 			if (revision !== before || !name) return;
@@ -460,12 +506,11 @@ export default function (pi: ExtensionAPI, factory: ClassifierFactory = classifi
 		return id;
 	}
 
-	/** Steps 9–11: a written task opens on its open questions; a task added later is filled in first. */
+	/** Steps 9–11: a written task opens on its summary and choices; a task added later is filled in first. */
 	async function openTask(ctx: ExtensionContext, id: string): Promise<void> {
 		selection = id;
 		intent = undefined;
 		next = undefined;
-		answering = undefined;
 		pi.appendEntry(ENTRY, { pair, spec, selection });
 		trace(ctx, "task_selected");
 		show(ctx);
@@ -473,8 +518,7 @@ export default function (pi: ExtensionAPI, factory: ClassifierFactory = classifi
 		if (selection !== id) return;
 		const task = loadSpec(ctx.cwd).view.tasks.find((item) => item.id === id);
 		if (!task) return;
-		// A written task opens on its own questions, if it still has any, and otherwise on review.
-		if (task.populated) return asked.has(id) ? reviewPrompt(ctx) : askQuestions(ctx);
+		if (task.populated) return taskMenu(ctx);
 		say(`Fill in task ${id}: ${task.name}.`, true, { task: id });
 	}
 
@@ -624,8 +668,8 @@ export default function (pi: ExtensionAPI, factory: ClassifierFactory = classifi
 	function restore(ctx: ExtensionContext) {
 		revision++;
 		next = undefined;
+		requested = undefined;
 		intent = undefined;
-		answering = undefined;
 		const entry = ctx.sessionManager.getBranch().findLast((entry) => entry.type === "custom" && entry.customType === ENTRY) as
 			{ data?: { pair?: boolean; spec?: string; selection?: string } } | undefined;
 		const name = entry?.data?.spec;
@@ -662,19 +706,13 @@ export default function (pi: ExtensionAPI, factory: ClassifierFactory = classifi
 	pi.on("session_tree", (_event, ctx) => restore(ctx));
 
 	pi.on("agent_settled", async (_event, ctx) => {
-		// A turn that was meant to bring back answers but wrote nothing still owes the developer a prompt.
-		const todo = next ?? (answering ? "review" : undefined);
+		const todo = next;
 		next = undefined;
-		if (todo !== "questions") answering = undefined;
 		if (!specMode()) return;
 		trace(ctx, "settled", { todo: todo ?? "nothing" });
 		if (!todo) return;
-		try {
-			if (todo === "tasks") await showTasks(ctx);
-			else if (todo === "questions") await askQuestions(ctx);
-			else if (todo === "agree") await approve(ctx); // Step 13, answered rather than pressed.
-			else await reviewPrompt(ctx);
-		} catch (error) { ctx.ui.notify((error as Error).message, "error"); }
+		try { await (todo === "tasks" ? showTasks(ctx) : taskMenu(ctx)); }
+		catch (error) { ctx.ui.notify((error as Error).message, "error"); }
 	});
 
 	pi.on("input", async (event, ctx) => {
@@ -682,6 +720,7 @@ export default function (pi: ExtensionAPI, factory: ClassifierFactory = classifi
 		const before = revision;
 		try {
 			trace(ctx, "input", { text: event.text, source: event.source });
+			if (event.text === requested) { requested = undefined; return; }
 			intent = undefined;
 			// Everything up to the first task list is linear: the contract follows the step, not the words.
 			if (!loadSpec(ctx.cwd).parsed.tasks.length) return;

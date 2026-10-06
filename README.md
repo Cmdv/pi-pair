@@ -76,13 +76,15 @@ From there the spec is written as you talk:
    for each.
 2. A connected editor with `open` support opens the Markdown, filled in, without
    taking chat focus or discarding unsaved changes.
-3. The task list opens: pick a task, add one, or approve the spec.
-4. A task with open questions opens on them: code sends the model to put them to
-   you through `pair_ask`, each with likely answers and its recommendation, then
-   it records what you say in the task. Answering them all agrees that task and
-   returns you to the list.
-5. A task with nothing to ask opens on a dialog: **Agree**, or **Discuss or
-   adjust** to talk about it first; `/pair:approve` agrees it at any point.
+3. The task list opens: pick a task, add one, **Describe changes…** across
+   several tasks, or approve the spec. A change request returns to the list
+   when the model finishes.
+4. A task opens on its **Summary**, with **Answer open questions** first when
+   needed, then **Agree**, **Describe changes…**, and **Back to the list**.
+   In pi.el, `TAB` or clicking **[more]** expands the full task.
+5. Questions and their options come from the spec, not another model turn.
+   Code asks and records your answers; answering them all agrees the task and
+   returns to the list. You can also agree directly with questions still open.
 6. Agreeing a task returns to the list, where **Approve spec** appears. Once
    every task is agreed the list opens on that choice. Approving the spec puts
    you into pairing mode with it, and the message gives the order the model
@@ -110,12 +112,15 @@ something you did not expect.
 
 A spec is `# Title`, `## Goal`, `## Order` and the tasks. Task headings are
 `## 1: Name`, numbered in the order to do them; `## Order` is the model's note
-on why that sequence, written with the task list. Each task has `### Task`,
-`### Research`, `### Proposed solution`, `### Questions`, `### Edge cases`, and
-`### Done when`.
+on why that sequence, written with the task list. Each task has `### Summary`,
+`### Task`, `### Research`, `### Proposed solution`, `### Questions`,
+`### Edge cases`, and `### Done when`. Summary is optional for existing specs;
+without it, the dialog uses the first paragraph of Task.
 Question/edge markers are `- [ ] Q1:` and `- [ ] E1:` in their respective
 sections; whatever shape the model writes the Questions section in, it is saved
-as those markers, so code can always tell what is still open. Checked questions need an Answer; checked edges need Expected and
+as those markers, so code can always tell what is still open. An indented
+`  - Options: a | b | c` supplies up to five answers, recommendation first;
+without options the answer is typed. Checked questions need an Answer; checked edges need Expected and
 Check, or either can record an explicit Out of scope reason. A task counts as
 written once Task, Proposed solution and Done when are filled in.
 
@@ -154,7 +159,9 @@ conversational "yes" never approves. Stopping preserves the spec and the
 discussion. pi.el clears queued steering/follow-up messages first and retains
 cancelled text without changing the draft.
 
-While pairing, Pi asks its own questions with `pair_ask`: one to five at a time,
+Spec's written questions use the same dialogs directly from code, without a
+`pair_ask` tool call or a permission prompt. While pairing, Pi asks its own
+questions with `pair_ask`: one to five at a time,
 each with a few likely answers, the model's recommendation marked
 `(recommended)`, and `Other…` to type your own. Each question
 has a tab, then a Submit tab: ←/→ or Tab move between them, so you can go
@@ -254,9 +261,10 @@ truncated. Scores are model probabilities, not calibrated permission confidence.
 Triage asks two questions—which part of the spec, and what to do with it—and
 treats anything below its 0.6 cutoff as unclear, which simply leaves the current
 scope in place. That cutoff is a development default, not a benchmarked one, and
-triage is deliberately never asked whether to approve or stop. `npm test` stays
-offline; a deterministic local fixture provider exercises actual Pi delivery and
-gates.
+triage is deliberately never asked whether to approve or stop. Classifier
+performance is checked manually with `classifier:smoke` and the readable triage
+logs. `npm test` uses stubs, never loads the ONNX model; a deterministic local
+fixture provider exercises actual Pi delivery and gates.
 
 ## Licence
 

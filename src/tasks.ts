@@ -2,11 +2,13 @@
  * Task content lives here, in Markdown; agreement and completion live in state.ts. */
 import { createHash } from "node:crypto";
 
-export const SECTIONS = ["Task", "Research", "Proposed solution", "Questions", "Edge cases", "Done when"] as const;
+/** Summary comes first: the few lines a developer reads before deciding whether to read the rest. */
+export const SECTIONS = ["Summary", "Task", "Research", "Proposed solution", "Questions", "Edge cases", "Done when"] as const;
 export type Section = (typeof SECTIONS)[number];
-/** Sections a task must fill before it can be ready; Research may say none was needed. */
+/** Sections a task must fill before it can be ready; Research may say none was needed, and Summary is optional. */
 export const REQUIRED: readonly Section[] = ["Task", "Proposed solution", "Done when"];
-export type Field = "Answer" | "Expected" | "Check" | "Out of scope";
+/** Options are the likely answers to a question, `a | b | c`, the recommendation first; code offers them in its dialog. */
+export type Field = "Answer" | "Expected" | "Check" | "Options" | "Out of scope";
 
 export type Problem = { message: string; line?: number };
 /** A question (Q1) or edge case (E1).  Checked means settled, not implemented or tested. */
@@ -43,7 +45,7 @@ const TASK_LIKE = /^\d+\b/;
 const SUBHEADING = /^### (.*?)\s*$/;
 const MARKER = /^- \[([ x])\] ([QE])(\d+):\s*(.*?)\s*$/;
 const MARKER_LIKE = /^\s*-\s+(\[|[QE]\d+:)/;
-const FIELD = /^\s+- (Answer|Expected|Check|Out of scope):\s*(.*?)\s*$/;
+const FIELD = /^\s+- (Answer|Expected|Check|Options|Out of scope):\s*(.*?)\s*$/;
 const CONTINUATION = /^\s{4,}(\S.*?)\s*$/;
 const FENCE = /^\s{0,3}(`{3,}|~{3,})/;
 
@@ -203,6 +205,12 @@ function checkItems(task: Task, problem: (index: number, message: string) => voi
 
 export const findTask = (spec: Spec, id: string) => spec.tasks.find((task) => task.id === id);
 
+/** The answers a question offers, as the model wrote them; none means the developer types one. */
+export const optionsOf = (item: Item) => item.fields.Options?.split("|").map((option) => option.trim()).filter(Boolean) ?? [];
+
+/** What the developer reads first: the Summary, or failing that the first paragraph of Task. */
+export const summaryOf = (task: Task) => task.sections.Summary?.text || task.sections.Task?.text.split(/\n\s*\n/)[0] || "";
+
 /** The number after the highest in the spec or in USED, which the state may still know; numbers are not reused,
  * and a task's number is its place in the order of work. */
 export function nextTaskId(spec: Spec, used: Iterable<string> = []): string {
@@ -260,6 +268,17 @@ export function updateTask(text: string, id: string, changes: TaskChanges): stri
 		edits.push({ start: task.start, end: task.start + 1, lines: [`## ${id}: ${changes.name.trim()}`] });
 	}
 	return splice(lines, edits);
+}
+
+/** TASK's Questions section with the questions in ANSWERS ticked and their Answer recorded, the others as they were.
+ * The developer's decision, written by code, so no model turn is needed to record it. */
+export function answeredQuestions(task: Task, answers: Record<string, string>): string {
+	return task.questions.flatMap((item) => {
+		const answer = answers[item.id];
+		const fields = { ...item.fields, ...(answer ? { Answer: answer } : {}) };
+		return [`- [${item.checked || answer ? "x" : " "}] ${item.id}: ${item.text}`,
+			...Object.entries(fields).map(([field, value]) => `  - ${field}: ${value}`)];
+	}).join("\n");
 }
 
 const NOTHING = /^(none|n\/a|no (open )?questions?)\.?$/i;

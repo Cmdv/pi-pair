@@ -12,9 +12,11 @@ export type Phase = "describe" | "populate" | "review" | "spec";
 /** Triage of the developer's last message: where they are pointing, and what they want done. */
 export type Intent = { scope?: Scope; operation?: string };
 
+/** The Summary is what the developer reads in the task's dialog; the questions are what code puts to them there. */
+const QUESTIONS = "Summary is two or three lines the developer reads first, enough to decide on the task without reading the rest. Only write a question when the developer must decide something reading the code cannot settle, one per line as `- [ ] Q1: ...` with up to five short likely answers on the next line as `  - Options: a | b | c`, your recommendation first; leave Questions empty otherwise. The task opens on its Summary; code asks these questions with their options only when the developer chooses Answer open questions, and records what they choose.";
 const INSTRUCTION: Record<Phase, string> = {
-	describe: "Write the whole spec in this one turn. First, if they are not there yet, one pair_write (kind tasks) with the goal, the task names in the order the work should be done (their numbers are that order), and order: a few lines on why that sequence. Then every task that is still empty, one pair_write (kind task) each, with all six sections: Task, Research, Proposed solution, Questions, Edge cases, Done when. Read the code once, up front, and reuse what you have read across the tasks rather than reading it again for each. A task you are filling in for the first time is empty, so it needs no baseHash; rewriting one you have written already this turn needs the baseHash listed for it below. Only write a question when the developer must decide something reading the code cannot settle, one per line as `- [ ] Q1: ...`, and leave Questions empty otherwise; code puts the open ones to the developer task by task. When every task is written, end with a short summary for the developer: the tasks in the order to do them, and why that order.",
-	populate: "Fill every section of this task with pair_write (kind task): Task, Research, Proposed solution, Questions, Edge cases, Done when. Read the code you need first. Only write a question when the developer must decide something reading the code cannot settle, one per line as `- [ ] Q1: ...`, and leave Questions empty otherwise; code puts the open ones to the developer as soon as you save.",
+	describe: "Write the whole spec in this one turn. First, if they are not there yet, one pair_write (kind tasks) with the goal, the task names in the order the work should be done (their numbers are that order), and order: a few lines on why that sequence. Then every task that is still empty, one pair_write (kind task) each, with all seven sections: Summary, Task, Research, Proposed solution, Questions, Edge cases, Done when. Read the code once, up front, and reuse what you have read across the tasks rather than reading it again for each. A task you are filling in for the first time is empty, so it needs no baseHash; rewriting one you have written already this turn needs the baseHash listed for it below. " + QUESTIONS + " When every task is written, end with a short summary for the developer: the tasks in the order to do them, and why that order.",
+	populate: "Fill every section of this task with pair_write (kind task): Summary, Task, Research, Proposed solution, Questions, Edge cases, Done when. Read the code you need first. " + QUESTIONS,
 	review: "This task is written and the developer is reviewing it. Discuss it, answer questions and save requested changes with pair_write. Only the developer's explicit approval agrees it.",
 	spec: "The task list is under review. Discuss it, and add or change tasks, the goal or the order with pair_write when the developer asks.",
 };
@@ -32,13 +34,13 @@ export function contractFor(snapshot: Snapshot, selection?: string, intent?: Int
 		tools: [...READ_TOOLS, "pair_ask", "pair_show_code", WRITE],
 		instruction: INSTRUCTION[phase],
 		// The spec's content is here, not in a file the model reads: the file is the developer's view.
-		context: `Goal: ${snapshot.parsed.goal || "(none yet)"}\nOrder: ${snapshot.parsed.order || "(none yet)"}\n` + (task
+		context: `Goal: ${snapshot.parsed.goal || "(none yet)"}\nOrder: ${snapshot.parsed.order || "(none yet)"}\n` + (task && write !== "any"
 			? `Current baseHash: ${task.hash}\n${snapshot.text.split("\n").slice(task.start, task.end).join("\n")}`
 			// Every task's hash is listed, so rewriting one never needs a guess or another read.
 			: "Tasks:\n" + (snapshot.parsed.tasks.map((item) => {
 				const view = snapshot.view.tasks.find((task) => task.id === item.id);
 				return `${item.id}: ${item.name} · ${view?.agreed ? "agreed" : view?.populated ? "written" : "empty"} · baseHash ${item.hash}`;
-			}).join("\n") || "(none yet)")),
+			}).join("\n") || "(none yet)") + `\n\n${snapshot.text}`),
 	};
 }
 export type Contract = ReturnType<typeof contractFor>;
