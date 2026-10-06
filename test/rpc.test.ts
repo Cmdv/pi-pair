@@ -8,7 +8,7 @@ import { fileURLToPath } from "node:url";
 import pkg from "../package.json" with { type: "json" };
 
 const cli = fileURLToPath(new URL("cli.js", import.meta.resolve("@earendil-works/pi-coding-agent")));
-const extension = fileURLToPath(new URL("../src/index.ts", import.meta.url));
+const extension = fileURLToPath(new URL("./fixtures/offline-extension.ts", import.meta.url));
 
 test("real Pi RPC starts and falls back without any model calls", async (t) => {
 	for (const response of ["no-adapter", "valid", "invalid", "cancelled", "wrong-id"] as const) {
@@ -72,8 +72,8 @@ test("real Pi RPC starts and falls back without any model calls", async (t) => {
 									}),
 								});
 							}
-							if (event.type === "extension_ui_request" && event.method === "select" && event.title === "Spec") {
-								send({ type: "extension_ui_response", id: event.id, value: "No spec" });
+							if (event.type === "extension_ui_request" && event.method === "select" && event.title === "Pair") {
+								send({ type: "extension_ui_response", id: event.id, value: "Pair no spec" });
 							}
 							if (event.type === "extension_ui_request" && event.title === "pi-pair:v1:clear") {
 								assert.equal(event.method, "input");
@@ -84,7 +84,7 @@ test("real Pi RPC starts and falls back without any model calls", async (t) => {
 								assert.equal(event.success, true, event.error);
 								if (event.id === "commands") {
 									assert.ok(event.data.commands.some((command: any) => command.name === "pair"));
-									send({ id: "mode", type: "prompt", message: "/pair me" });
+									send({ id: "mode", type: "prompt", message: "/pair" });
 								}
 								if (event.id === "mode") {
 									modeDone = true;
@@ -112,7 +112,7 @@ test("real Pi RPC starts and falls back without any model calls", async (t) => {
 			assert.equal(warnings.length, expectsWarning ? 1 : 0);
 			if (expectsWarning) assert.match(warnings[0].message, /Pairing adapter unavailable/);
 			if (response === "wrong-id") assert.match(warnings[0].message, /cancelled or timed out/);
-			assert.ok(events.some((event) => event.statusKey === "pair" && event.statusText?.includes("Me")));
+			assert.ok(events.some((event) => event.statusKey === "pair" && event.statusText === "🧑‍🤝‍🧑 Pair"));
 			assert.equal(events.some((event) => event.type === "agent_start" || event.type === "extension_error"), false);
 		});
 	}

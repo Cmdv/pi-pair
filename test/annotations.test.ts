@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import pair from "../src/index.ts";
+import { readyClassifier } from "./classifier-stub.ts";
 import type { Annotation } from "../src/protocol.ts";
 
 test("annotations are capability-gated, acknowledged before persistence and safe across session changes", async () => {
@@ -15,29 +16,30 @@ test("annotations are capability-gated, acknowledged before persistence and safe
 		on(name, handler) { handlers.set(name, handler); return () => {}; },
 		registerCommand(name, command) { commands.set(name, command); },
 		registerTool(value) { tools.set(value.name, value); },
+		registerMessageRenderer() {}, sendMessage() {},
 		getActiveTools: () => activeTools,
-		// pair_ask follows the mode alone; these lists track pair_show_code.
+		// pair_ask follows Pair alone; these lists track pair_show_code.
 		setActiveTools(tools) { asking = tools.includes("pair_ask"); activeTools = tools.filter((name) => name !== "pair_ask"); },
 		appendEntry(type, data) { entries.push({ type, data }); },
 	};
-	pair(api as ExtensionAPI);
+	pair(api as ExtensionAPI, readyClassifier);
 
 	let capabilities = ["present", "annotate", "clear"]; 
 	let showWhenOff: boolean | undefined;
-	let restored = "me";
+	let restored = true;
 	process.env.PI_PAIR_EDITOR = "test";
 	let response: () => Promise<string | undefined> = async () => '{"ok":true}';
 	const calls: { method: string; args: any }[] = [];
 	const notices: unknown[][] = [];
 	const ctx = {
 		cwd: "/no-project",
-		mode: "rpc",
-		isIdle: () => true,
-		sessionManager: { getBranch: () => [{ type: "custom", customType: "pi-pair", data: { mode: restored } }] },
+		mode: "rpc", hasUI: true,
+		isIdle: () => true, hasPendingMessages: () => false, waitForIdle: async () => {},
+		sessionManager: { getSessionId: () => "test", getBranch: () => [{ type: "custom", customType: "pi-pair", data: { pair: restored } }] },
 		ui: {
 			setStatus() {},
 			notify(...args: unknown[]) { notices.push(args); },
-			select: async () => "No spec", // The spec picker.
+			select: async () => "Pair no spec", // The spec picker.
 			async input(title: string, body: string) {
 				const method = title.split(":").at(-1)!;
 				calls.push({ method, args: JSON.parse(body) });
@@ -99,7 +101,7 @@ test("annotations are capability-gated, acknowledged before persistence and safe
 	await assert.rejects(run(), /Pairing is off/);
 	// An editor reporting showWhenOff keeps showing code while off.
 	showWhenOff = true;
-	restored = "off";
+	restored = false;
 	await start();
 	assert.deepEqual(activeTools, ["read", "another_tool", "pair_show_code"]);
 	assert.equal(asking, false);
@@ -107,7 +109,7 @@ test("annotations are capability-gated, acknowledged before persistence and safe
 	await run();
 	assert.deepEqual(calls.at(-1)!.method, "present");
 	showWhenOff = undefined;
-	restored = "me";
+	restored = true;
 	await clear("all"); // An explicit developer action remains available while off.
 	assert.deepEqual(calls.at(-1), { method: "clear", args: { all: true } });
 	assert.deepEqual(entries.at(-1), { type: "pi-pair-clear", data: { all: true } });
@@ -116,7 +118,7 @@ test("annotations are capability-gated, acknowledged before persistence and safe
 	await clear("all another-id");
 	assert.equal(calls.length, beforeUsage);
 
-	await commands.get("pair")!.handler("you", ctx);
+	await commands.get("pair")!.handler("", ctx);
 	for (const reply of [undefined, '{"ok":"yes"}', '{"ok":false,"error":"File unavailable"}']) {
 		response = async () => reply;
 		const before = entries.length;

@@ -2,19 +2,21 @@ import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { Static, TSchema } from "typebox";
 import { Value } from "typebox/value";
 import {
-	annotationSchema, bufferStateReplySchema, bufferStateSchema, clearSchema, handshakeReplySchema, handshakeRequestSchema,
-	presentSchema, replySchema, showSchema, type Annotation, type BufferState, type Clear, type Range,
+	annotationSchema, askReplySchema, bufferStateReplySchema, bufferStateSchema, clearSchema, handshakeReplySchema, handshakeRequestSchema,
+	openSchema, presentSchema, replySchema, showSchema, type Annotation, type BufferState, type Clear, type Range,
 } from "./protocol.ts";
+import { chosen, labelled, type Answers, type Question } from "./ask.ts";
 
-export type Send = (method: string, args: unknown, signal?: AbortSignal) => Promise<unknown>;
+/** TIMEOUT, in milliseconds, defaults to five seconds; 0 waits for as long as the editor takes. */
+export type Send = (method: string, args: unknown, signal?: AbortSignal, timeout?: number) => Promise<unknown>;
 
 export function rpcTransport(ctx: ExtensionContext): Send {
-	return async (method, args, signal) => {
+	return async (method, args, signal, timeout = 5000) => {
 		if (ctx.mode !== "rpc") throw new Error("Adapter transport requires RPC mode.");
 		const reply = await ctx.ui.input(
 			`pi-pair:v1:${method}`,
 			JSON.stringify(args),
-			{ signal, timeout: 5000 },
+			{ signal, timeout },
 		);
 		if (reply === undefined) throw new Error("Adapter request cancelled or timed out.");
 		return JSON.parse(reply);
@@ -26,9 +28,9 @@ function checked<S extends TSchema>(schema: S, value: unknown, message: string):
 	return value;
 }
 
-async function call(send: Send, method: string, args: unknown, signal?: AbortSignal) {
+async function call(send: Send, method: string, args: unknown, signal?: AbortSignal, timeout?: number) {
 	signal?.throwIfAborted();
-	const reply = await send(method, args, signal);
+	const reply = await send(method, args, signal, timeout);
 	signal?.throwIfAborted(); // Do not record a late acknowledgement in a replacement session.
 	if (Value.Check(replySchema, reply) && !reply.ok) throw new Error(`Adapter ${method}: ${reply.error}`);
 	return reply;
@@ -63,6 +65,12 @@ export async function show(send: Send, ranges: Range[], signal?: AbortSignal): P
 	checked(replySchema, await call(send, "show", { ranges }, signal), "Invalid adapter show reply.");
 }
 
+/** Open the actual file without taking chat focus or discarding editor changes. */
+export async function open(send: Send, path: string, signal?: AbortSignal): Promise<void> {
+	checked(openSchema, { path }, "Invalid open path: use a project-relative file.");
+	checked(replySchema, await call(send, "open", { path }, signal), "Invalid adapter open reply.");
+}
+
 /** Whether each path is open and modified in the editor, in request order. */
 export async function bufferState(send: Send, paths: string[], signal?: AbortSignal): Promise<BufferState[]> {
 	checked(bufferStateSchema, { paths }, "Invalid buffer_state paths: use unique project-relative paths.");
@@ -72,6 +80,14 @@ export async function bufferState(send: Send, paths: string[], signal?: AbortSig
 		throw new Error("Adapter buffer_state reply does not match the requested paths.");
 	}
 	return buffers;
+}
+
+/** Ask QUESTIONS in the editor's tabbed dialog, waiting for the developer's answers. */
+export async function ask(send: Send, questions: Question[], signal?: AbortSignal): Promise<Answers> {
+	const shown = questions.map((question) => ({ ...question, options: labelled(question.options) }));
+	const { answers } = checked(askReplySchema, await call(send, "ask", { questions: shown }, signal, 0), "Invalid adapter ask reply.");
+	if (answers.length !== questions.length) throw new Error("Adapter ask reply does not match the questions.");
+	return answers.map((answer) => answer && { ...answer, answer: chosen(answer.answer) });
 }
 
 export async function clear(send: Send, selection: Clear, signal?: AbortSignal): Promise<void> {

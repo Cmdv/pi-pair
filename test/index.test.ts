@@ -3,22 +3,8 @@ import { test } from "node:test";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import pkg from "../package.json" with { type: "json" };
 import pair from "../src/index.ts";
-import type { State } from "../src/modes.ts";
-
-function assertAssistantEdits(text: unknown) {
-	assert.ok(typeof text === "string");
-	assert.match(text, /use edit\/write tools yourself/);
-	assert.match(text, /Do not hand the developer code to type or paste/);
-	assert.match(text, /another go-ahead in chat/);
-	assert.match(text, /tool approval mechanism; never bypass it/);
-	assert.match(text, /Follow the current mode even if earlier messages used a developer-types workflow/);
-	assert.match(text, /asks only for an explanation or instructions, answer without editing/);
-	assert.match(text, /before the first edit\/write after each developer prompt/);
-	assert.match(text, /brief comment saying what you are about to change/);
-	assert.doesNotMatch(text, /The developer writes all the code/);
-}
-
-test("restored, idle and mid-turn modes explicitly assign edits to the assistant", async () => {
+import { readyClassifier } from "./classifier-stub.ts";
+test("Pair restores on/off and leaves Pair no spec ungated", async () => {
 	const handlers = new Map<string, (...args: any[]) => any>();
 	let command!: Parameters<ExtensionAPI["registerCommand"]>[1];
 	const messages: { content: unknown; options: unknown }[] = [];
@@ -27,53 +13,46 @@ test("restored, idle and mid-turn modes explicitly assign edits to the assistant
 		on(name, handler) { handlers.set(name, handler); return () => {}; },
 		registerCommand(name, options) { if (name === "pair") command = options; },
 		registerTool() {},
+		registerMessageRenderer() {},
 		getActiveTools: () => activeTools,
 		setActiveTools(tools) { activeTools = tools; },
 		appendEntry() {},
 		sendMessage(message, options) { messages.push({ content: message.content, options }); },
 	};
-	pair(api as ExtensionAPI);
+	pair(api as ExtensionAPI, readyClassifier);
 
 	let idle = true;
-	let savedMode: State = "off";
+	let savedPair = false;
 	const ctx = {
-		cwd: "/no-project",
-		isIdle: () => idle,
-		sessionManager: { getBranch: () => [{ type: "custom", customType: "pi-pair", data: { mode: savedMode } }] },
-		// The spec picker, answered with No spec.
-		ui: { setStatus() {}, notify() {}, select: async () => "No spec" },
+		cwd: "/no-project", hasUI: true,
+		isIdle: () => idle, hasPendingMessages: () => false, abort: () => { idle = true; }, waitForIdle: async () => {},
+		sessionManager: { getSessionId: () => "test", getBranch: () => [{ type: "custom", customType: "pi-pair", data: { pair: savedPair } }] },
+		// The spec picker, answered with Pair no spec.
+		ui: { setStatus() {}, notify() {}, select: async () => "Pair no spec" },
 	} as unknown as ExtensionCommandContext;
 	const prompt = async () => (await handlers.get("before_agent_start")!({ systemPrompt: "base" }, ctx))?.systemPrompt;
 	const edit = () => handlers.get("tool_call")!({ toolName: "edit", input: { edits: [] } }, ctx);
 
-	for (const mode of ["both", "you"] as const) {
-		savedMode = mode;
-		await handlers.get("session_start")!({}, ctx);
-		assertAssistantEdits(await prompt());
+	await handlers.get("session_start")!({}, ctx);
+	assert.equal(await prompt(), undefined);
+	assert.equal(edit(), undefined);
+	await command.handler("", ctx);
+	assert.match(await prompt(), /^base\n\nPair is on without a spec/);
+	assert.equal(edit(), undefined);
+	assert.ok(activeTools.includes("pair_ask"));
+	assert.equal(messages.length, 0);
 
-		await command.handler("me", ctx);
-		assert.equal(edit().block, true);
-		messages.length = 0;
-		await command.handler(mode, ctx);
-		assertAssistantEdits(await prompt());
-		assert.match(await prompt(), /^base\n\nPairing mode:/);
-		assert.equal(edit(), undefined);
-		assert.equal(messages.length, 0); // Idle switches rely on the next system prompt.
-
-		idle = false;
-		await command.handler("me", ctx);
-		messages.length = 0;
-		await command.handler(mode, ctx);
-		assert.equal(messages.length, 1);
-		assertAssistantEdits(messages[0].content);
-		assert.match(String(messages[0].content), /Apply the new mode now; stop following the previous mode's workflow/);
-		assert.deepEqual(messages[0].options, { deliverAs: "steer" });
-
-		idle = true;
-		await command.handler("off", ctx);
-		assert.equal(await prompt(), undefined);
-		assert.equal(edit(), undefined);
-	}
+	idle = false;
+	await command.handler("off", ctx);
+	assert.equal(await prompt(), undefined);
+	assert.match(String(messages[0].content), /Pair stopped/);
+	assert.deepEqual(messages[0].options, { triggerTurn: false });
+	assert.ok(!activeTools.includes("pair_ask"));
+	idle = true;
+	savedPair = true;
+	await handlers.get("session_start")!({}, ctx);
+	assert.match(await prompt(), /Pair is on without a spec/);
+	assert.equal(edit(), undefined);
 });
 
 test("adapter startup is opt-in, non-blocking, capability-driven and safe to reset", async (t) => {
@@ -90,11 +69,12 @@ test("adapter startup is opt-in, non-blocking, capability-driven and safe to res
 		on(name, handler) { handlers.set(name, handler); return () => {}; },
 		registerCommand() {},
 		registerTool() {},
+		registerMessageRenderer() {},
 		getActiveTools: () => activeTools,
-		// pair_ask follows the mode alone; these lists track pair_show_code.
+		// pair_ask follows Pair alone; these lists track pair_show_code.
 		setActiveTools(tools) { asking = tools.includes("pair_ask"); activeTools = tools.filter((name) => name !== "pair_ask"); },
 	};
-	pair(api as ExtensionAPI);
+	pair(api as ExtensionAPI, readyClassifier);
 
 	const valid = { version: 1, editor: "any-editor", capabilities: ["present"] };
 	let input: ExtensionContext["ui"]["input"] = async () => JSON.stringify(valid);
@@ -102,7 +82,7 @@ test("adapter startup is opt-in, non-blocking, capability-driven and safe to res
 	const warnings: unknown[][] = [];
 	const ctx = {
 		mode: "rpc",
-		sessionManager: { getBranch: () => [{ type: "custom", customType: "pi-pair", data: { mode: "you" } }] },
+		sessionManager: { getBranch: () => [{ type: "custom", customType: "pi-pair", data: { pair: true } }] },
 		ui: {
 			setStatus() {},
 			notify(...args: unknown[]) { warnings.push(args); },
@@ -176,6 +156,6 @@ test("adapter startup is opt-in, non-blocking, capability-driven and safe to res
 	handlers.get("session_shutdown")!({}, ctx);
 	assert.equal(shutdownSignal.aborted, true);
 	reply(JSON.stringify(valid));
-	assert.match(await prompt(), /cite path:line/);
+	assert.match(await prompt(), /cite path:line/); // A handshake that lands after shutdown grants nothing.
 	assert.equal(warnings.length, 0);
 });

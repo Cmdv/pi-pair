@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { clear, present, show, type Send } from "./adapter.ts";
 import { showCodeParameters, type Annotation, type Clear, type Range, type RangeInput } from "./protocol.ts";
 
@@ -14,7 +14,7 @@ const plural = (count: number) => `${count} range${count === 1 ? "" : "s"}`;
 
 /** pair_show_code and /pair:clear.  ALLOWED says whether showing code is on now; CONNECT
  * resolves the adapter or throws; CURRENT identifies it, so a stale failure stays quiet. */
-export function registerShow(pi: ExtensionAPI, allowed: () => boolean, connect: (capability: "show" | "present" | "clear") => Promise<Connected>, current: () => unknown) {
+export function registerShow(pi: ExtensionAPI, allowed: (ctx: ExtensionContext) => boolean | AbortSignal, connect: (capability: "show" | "present" | "clear") => Promise<Connected>, current: () => unknown) {
 	pi.registerTool({
 		name: SHOW_CODE,
 		label: "Show code",
@@ -24,15 +24,15 @@ export function registerShow(pi: ExtensionAPI, allowed: () => boolean, connect: 
 			"Opens the first range.  If unavailable, cite path:line in text instead.",
 		parameters: showCodeParameters,
 		executionMode: "sequential",
-		async execute(_id, params, signal): Promise<{ content: { type: "text"; text: string }[]; details: { ranges?: Range[]; annotations?: Annotation[] } }> {
+		async execute(_id, params, signal, _update, ctx): Promise<{ content: { type: "text"; text: string }[]; details: { ranges?: Range[]; annotations?: Annotation[] } }> {
 			const { mode, ranges } = params;
 			if (mode === "annotate" && ranges.some((r) => !r.note?.trim())) throw new Error("annotate needs a note on every range; use show to highlight without notes.");
 			if (mode === "show" && ranges.some((r) => r.note !== undefined)) throw new Error("show takes no notes; use annotate to attach notes.");
-			if (!allowed()) throw new Error("Pairing is off.");
+			const permission = allowed(ctx);
+			if (!permission) throw new Error("Pairing is off or this turn cannot show code.");
 			const connected = await connect(NEEDS[mode]);
-			// The developer may have switched off while we waited for the handshake.
-			if (!allowed()) throw new Error("Pairing is off.");
-			const requestSignal = signal ? AbortSignal.any([signal, connected.signal]) : connected.signal;
+			if (allowed(ctx) !== permission) throw new Error("Pair request changed while connecting to the editor.");
+			const requestSignal = AbortSignal.any([connected.signal, ...(signal ? [signal] : []), ...(permission instanceof AbortSignal ? [permission] : [])]);
 			if (mode === "show") {
 				const shown = ranges.map(range);
 				await show(connected.send, shown, requestSignal);

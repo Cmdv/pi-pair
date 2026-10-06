@@ -1,5 +1,6 @@
 import { Type } from "typebox";
 import wire from "../protocol/v1.schema.json" with { type: "json" };
+import type { Answers, Question } from "./ask.ts";
 
 export type Annotation = {
 	id: string;
@@ -27,6 +28,8 @@ export const annotationSchema = Type.Unsafe<Annotation>(wire.$defs.annotateReque
 export const presentSchema = Type.Object({ annotations: Type.Array(annotationSchema, { minItems: 1 }) }, { additionalProperties: false });
 export const clearSchema = Type.Unsafe<Clear>(wire.$defs.clearRequest);
 export const replySchema = Type.Unsafe<{ ok: true } | { ok: false; error: string }>(wire.$defs.reply);
+export const askRequestSchema = Type.Unsafe<{ questions: Question[] }>(wire.$defs.askRequest);
+export const askReplySchema = Type.Unsafe<{ ok: true; answers: Answers }>(wire.$defs.askReply);
 
 const fields = wire.$defs.annotateRequest.properties;
 // The JSON's $refs don't resolve once a $defs entry is lifted out, so restate them.
@@ -38,6 +41,7 @@ export const showSchema = Type.Object({
 	}, { additionalProperties: false }), { minItems: 1 }),
 }, { additionalProperties: false });
 
+export const openSchema = Type.Object({ path: Type.Unsafe<string>(fields.path) }, { additionalProperties: false });
 export const bufferStateSchema = Type.Object({
 	paths: Type.Array(Type.Unsafe<string>(fields.path), { minItems: 1, uniqueItems: true }),
 }, { additionalProperties: false });

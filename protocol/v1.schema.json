@@ -69,6 +69,13 @@
       "required": ["annotations"],
       "additionalProperties": false
     },
+    "openRequest": {
+      "type": "object",
+      "$comment": "Open an actual project file without taking chat focus or reverting a modified buffer.",
+      "properties": { "path": { "$ref": "#/$defs/annotateRequest/properties/path" } },
+      "required": ["path"],
+      "additionalProperties": false
+    },
     "bufferStateRequest": {
       "type": "object",
       "properties": {
@@ -102,6 +109,52 @@
         }
       },
       "required": ["ok", "buffers"],
+      "additionalProperties": false
+    },
+    "askRequest": {
+      "type": "object",
+      "$comment": "Waits for the developer, without a timeout: a tab per question, then Submit.",
+      "properties": {
+        "questions": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 5,
+          "items": {
+            "type": "object",
+            "properties": {
+              "label": { "type": "string", "minLength": 1, "maxLength": 16 },
+              "question": { "type": "string", "minLength": 1 },
+              "options": { "type": "array", "minItems": 2, "maxItems": 5, "items": { "type": "string", "minLength": 1 } }
+            },
+            "required": ["label", "question", "options"],
+            "additionalProperties": false
+          }
+        }
+      },
+      "required": ["questions"],
+      "additionalProperties": false
+    },
+    "askReply": {
+      "type": "object",
+      "$comment": "One entry per question, in request order: null when skipped. Cancelling skips every question.",
+      "properties": {
+        "ok": { "const": true },
+        "answers": {
+          "type": "array",
+          "items": {
+            "oneOf": [
+              { "type": "null" },
+              {
+                "type": "object",
+                "properties": { "answer": { "type": "string", "minLength": 1 }, "typed": { "type": "boolean" } },
+                "required": ["answer", "typed"],
+                "additionalProperties": false
+              }
+            ]
+          }
+        }
+      },
+      "required": ["ok", "answers"],
       "additionalProperties": false
     },
     "clearRequest": {

@@ -40,11 +40,11 @@
           (pi--annotate session '((id . "real-clear") (path . "code.txt")
                                  (start_line . 3) (end_line . 3)
                                  (note . "Clear this through real RPC") (kind . "note")))
-          ;; /pair me asks for a spec; answer No spec.
+          ;; /pair asks for a spec; answer No spec.
           (cl-letf (((symbol-function 'pi--open-dialog)
                      (lambda (_session _request &rest args)
                        (funcall (plist-get args :callback) "No spec"))))
-            (dolist (command '("/pair me" "/pair:clear all"))
+            (dolist (command '("/pair" "/pair:clear all"))
               (let ((response (pi-rpc-request-sync
                                process "prompt" `((message . ,command)) 15)))
                 (unless (alist-get 'success response)

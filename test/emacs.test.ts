@@ -7,7 +7,7 @@ import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 import { Value } from "typebox/value";
 import {
-	annotationSchema, bufferStateReplySchema, bufferStateSchema, clearSchema, handshakeReplySchema, handshakeRequestSchema,
+	annotationSchema, askRequestSchema, bufferStateReplySchema, bufferStateSchema, clearSchema, handshakeReplySchema, handshakeRequestSchema,
 	presentSchema, replySchema, showSchema,
 } from "../src/protocol.ts";
 
@@ -46,6 +46,11 @@ test("Emacs schema conformance and real core RPC handshake/clear, without a mode
 	for (const paths of [[], ["code.txt", "code.txt"], ["../x"], ["/etc/passwd"]]) {
 		cases.push({ method: "buffer_state", args: { paths }, valid: false, count: 3 });
 	}
+	// A valid ask waits for the developer, so only rejections replay here.
+	const question = { label: "Scope", question: "Which files?", options: ["src", "all"] };
+	for (const questions of [[], Array(6).fill(question), [{ ...question, label: "A label far too long" }], [{ ...question, options: ["src"] }], [{ ...question, extra: true }]]) {
+		cases.push({ method: "ask", args: { questions }, valid: false, count: 3 });
+	}
 	for (const args of [{}, { all: false }, { all: null }, { ids: [] }, { ids: ["one", "one"] }, { ids: ["one", 42] }, { ids: ["one"], all: true }]) {
 		cases.push({ method: "clear", args, valid: false, count: 3 });
 	}
@@ -53,7 +58,7 @@ test("Emacs schema conformance and real core RPC handshake/clear, without a mode
 	cases.push({ method: "clear", args: { all: true }, valid: true, count: 0 });
 	const requests = cases.map(({ method, args, valid }, i) => {
 		const schema = { handshake: handshakeRequestSchema, annotate: annotationSchema, present: presentSchema, show: showSchema,
-			buffer_state: bufferStateSchema }[method] ?? clearSchema;
+			buffer_state: bufferStateSchema, ask: askRequestSchema }[method] ?? clearSchema;
 		assert.equal(Value.Check(schema, args), valid, `fixture ${i}`);
 		return { method: "input", id: `case-${i}`, title: `pi-pair:v1:${method}`, placeholder: JSON.stringify(args) };
 	});
@@ -62,7 +67,7 @@ test("Emacs schema conformance and real core RPC handshake/clear, without a mode
 	const run = spawnSync(emacs, ["-Q", "--batch", "-L", frontend, "-l",
 		fileURLToPath(new URL("./emacs-replay.el", import.meta.url)), "requests.json", "replies.json",
 		fileURLToPath(new URL("cli.js", import.meta.resolve("@earendil-works/pi-coding-agent"))),
-		fileURLToPath(new URL("../src/index.ts", import.meta.url))], {
+		fileURLToPath(new URL("./fixtures/offline-extension.ts", import.meta.url))], {
 		cwd, encoding: "utf8", timeout: 20000,
 		env: { PATH: process.env.PATH, HOME: cwd, PI_CODING_AGENT_DIR: join(cwd, "agent"), PI_TELEMETRY: "0" },
 	});
