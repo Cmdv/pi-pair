@@ -103,7 +103,7 @@ No new wire envelope is needed for controls. Core status key `pair` identifies
 active Pair/Spec and the selected task; removing it restores ordinary Pi styling.
 Widget `pi-pair` lists contextual slash commands on one line. `/pair:approve`
 appears only when there is something to approve, `/pair:tasks` when tasks exist,
-and `/pair off` while Pair is active. Frontends may bind keys to these commands,
+and `/pair:exit` while Pair is active. Frontends may bind keys to these commands,
 preserving an existing composer draft. The backend remains authoritative.
 Visible `customType: "pi-pair"` messages carry full prompt/save/handoff text;
 render them prominently and persistently, tinted apart from the developer's own. Never display `display: false`

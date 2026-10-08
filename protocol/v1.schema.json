@@ -5,38 +5,88 @@
     "handshakeRequest": {
       "type": "object",
       "properties": {
-        "version": { "const": 1 },
-        "coreVersion": { "type": "string", "minLength": 1 }
+        "version": {
+          "const": 1
+        },
+        "coreVersion": {
+          "type": "string",
+          "minLength": 1
+        }
       },
-      "required": ["version", "coreVersion"],
+      "required": [
+        "version",
+        "coreVersion"
+      ],
       "additionalProperties": false
     },
     "handshakeReply": {
       "type": "object",
       "properties": {
-        "version": { "const": 1 },
-        "editor": { "type": "string", "minLength": 1 },
-        "capabilities": { "type": "array", "items": { "type": "string", "minLength": 1 }, "uniqueItems": true },
-        "showWhenOff": { "type": "boolean", "$comment": "The developer's choice to keep pair_show_code while pairing is off; default false." }
+        "version": {
+          "const": 1
+        },
+        "editor": {
+          "type": "string",
+          "minLength": 1
+        },
+        "capabilities": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "uniqueItems": true
+        },
+        "showWhenOff": {
+          "type": "boolean",
+          "$comment": "The developer's choice to keep pair_show_code while pairing is off; default false."
+        }
       },
-      "required": ["version", "editor", "capabilities"],
+      "required": [
+        "version",
+        "editor",
+        "capabilities"
+      ],
       "additionalProperties": false
     },
     "annotateRequest": {
       "type": "object",
       "$comment": "Also require end_line >= start_line. The adapter validates the range in the current buffer and resolves paths within the project, including symlinks.",
       "properties": {
-        "id": { "type": "string", "minLength": 1 },
+        "id": {
+          "type": "string",
+          "minLength": 1
+        },
         "path": {
           "type": "string",
           "pattern": "^(?!\\.\\.?(/|$))[^/\\\\:\\u0000-\\u001f]+(/(?!\\.\\.?(/|$))[^/\\\\:\\u0000-\\u001f]+)*(?![\\s\\S])"
         },
-        "start_line": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
-        "end_line": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
-        "note": { "type": "string", "pattern": "\\S" },
-        "kind": { "const": "note" }
+        "start_line": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 9007199254740991
+        },
+        "end_line": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 9007199254740991
+        },
+        "note": {
+          "type": "string",
+          "pattern": "\\S"
+        },
+        "kind": {
+          "const": "note"
+        }
       },
-      "required": ["id", "path", "start_line", "end_line", "note", "kind"],
+      "required": [
+        "id",
+        "path",
+        "start_line",
+        "end_line",
+        "note",
+        "kind"
+      ],
       "additionalProperties": false
     },
     "showRequest": {
@@ -49,31 +99,57 @@
           "items": {
             "type": "object",
             "properties": {
-              "path": { "$ref": "#/$defs/annotateRequest/properties/path" },
-              "start_line": { "$ref": "#/$defs/annotateRequest/properties/start_line" },
-              "end_line": { "$ref": "#/$defs/annotateRequest/properties/end_line" }
+              "path": {
+                "$ref": "#/$defs/annotateRequest/properties/path"
+              },
+              "start_line": {
+                "$ref": "#/$defs/annotateRequest/properties/start_line"
+              },
+              "end_line": {
+                "$ref": "#/$defs/annotateRequest/properties/end_line"
+              }
             },
-            "required": ["path", "start_line", "end_line"],
+            "required": [
+              "path",
+              "start_line",
+              "end_line"
+            ],
             "additionalProperties": false
           }
         }
       },
-      "required": ["ranges"],
+      "required": [
+        "ranges"
+      ],
       "additionalProperties": false
     },
     "presentRequest": {
       "type": "object",
       "properties": {
-        "annotations": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/annotateRequest" } }
+        "annotations": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/annotateRequest"
+          }
+        }
       },
-      "required": ["annotations"],
+      "required": [
+        "annotations"
+      ],
       "additionalProperties": false
     },
     "openRequest": {
       "type": "object",
       "$comment": "Open an actual project file without taking chat focus or reverting a modified buffer.",
-      "properties": { "path": { "$ref": "#/$defs/annotateRequest/properties/path" } },
-      "required": ["path"],
+      "properties": {
+        "path": {
+          "$ref": "#/$defs/annotateRequest/properties/path"
+        }
+      },
+      "required": [
+        "path"
+      ],
       "additionalProperties": false
     },
     "bufferStateRequest": {
@@ -83,32 +159,59 @@
           "type": "array",
           "minItems": 1,
           "uniqueItems": true,
-          "items": { "$ref": "#/$defs/annotateRequest/properties/path" }
+          "items": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/annotateRequest/properties/path"
+              },
+              {
+                "type": "string",
+                "pattern": "^/"
+              }
+            ]
+          }
         }
       },
-      "required": ["paths"],
+      "required": [
+        "paths"
+      ],
       "additionalProperties": false
     },
     "bufferStateReply": {
       "type": "object",
       "$comment": "One entry per requested path, in request order. Never opens a file.",
       "properties": {
-        "ok": { "const": true },
+        "ok": {
+          "const": true
+        },
         "buffers": {
           "type": "array",
           "items": {
             "type": "object",
             "properties": {
-              "path": { "type": "string" },
-              "open": { "type": "boolean" },
-              "modified": { "type": "boolean" }
+              "path": {
+                "type": "string"
+              },
+              "open": {
+                "type": "boolean"
+              },
+              "modified": {
+                "type": "boolean"
+              }
             },
-            "required": ["path", "open", "modified"],
+            "required": [
+              "path",
+              "open",
+              "modified"
+            ],
             "additionalProperties": false
           }
         }
       },
-      "required": ["ok", "buffers"],
+      "required": [
+        "ok",
+        "buffers"
+      ],
       "additionalProperties": false
     },
     "askRequest": {
@@ -122,53 +225,109 @@
           "items": {
             "type": "object",
             "properties": {
-              "label": { "type": "string", "minLength": 1, "maxLength": 16 },
-              "question": { "type": "string", "minLength": 1 },
-              "options": { "type": "array", "maxItems": 5, "items": { "type": "string", "minLength": 1 } }
+              "label": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 16
+              },
+              "question": {
+                "type": "string",
+                "minLength": 1
+              },
+              "options": {
+                "type": "array",
+                "maxItems": 5,
+                "items": {
+                  "type": "string",
+                  "minLength": 1
+                }
+              }
             },
-            "required": ["label", "question", "options"],
+            "required": [
+              "label",
+              "question",
+              "options"
+            ],
             "additionalProperties": false
           }
         }
       },
-      "required": ["questions"],
+      "required": [
+        "questions"
+      ],
       "additionalProperties": false
     },
     "askReply": {
       "type": "object",
       "$comment": "One entry per question, in request order: null when skipped. Cancelling skips every question.",
       "properties": {
-        "ok": { "const": true },
+        "ok": {
+          "const": true
+        },
         "answers": {
           "type": "array",
           "items": {
             "oneOf": [
-              { "type": "null" },
+              {
+                "type": "null"
+              },
               {
                 "type": "object",
-                "properties": { "answer": { "type": "string", "minLength": 1 }, "typed": { "type": "boolean" } },
-                "required": ["answer", "typed"],
+                "properties": {
+                  "answer": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "typed": {
+                    "type": "boolean"
+                  }
+                },
+                "required": [
+                  "answer",
+                  "typed"
+                ],
                 "additionalProperties": false
               }
             ]
           }
         }
       },
-      "required": ["ok", "answers"],
+      "required": [
+        "ok",
+        "answers"
+      ],
       "additionalProperties": false
     },
     "clearRequest": {
       "oneOf": [
         {
           "type": "object",
-          "properties": { "ids": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "type": "string", "minLength": 1 } } },
-          "required": ["ids"],
+          "properties": {
+            "ids": {
+              "type": "array",
+              "minItems": 1,
+              "uniqueItems": true,
+              "items": {
+                "type": "string",
+                "minLength": 1
+              }
+            }
+          },
+          "required": [
+            "ids"
+          ],
           "additionalProperties": false
         },
         {
           "type": "object",
-          "properties": { "all": { "const": true } },
-          "required": ["all"],
+          "properties": {
+            "all": {
+              "const": true
+            }
+          },
+          "required": [
+            "all"
+          ],
           "additionalProperties": false
         }
       ]
@@ -177,14 +336,31 @@
       "oneOf": [
         {
           "type": "object",
-          "properties": { "ok": { "const": true } },
-          "required": ["ok"],
+          "properties": {
+            "ok": {
+              "const": true
+            }
+          },
+          "required": [
+            "ok"
+          ],
           "additionalProperties": false
         },
         {
           "type": "object",
-          "properties": { "ok": { "const": false }, "error": { "type": "string", "minLength": 1 } },
-          "required": ["ok", "error"],
+          "properties": {
+            "ok": {
+              "const": false
+            },
+            "error": {
+              "type": "string",
+              "minLength": 1
+            }
+          },
+          "required": [
+            "ok",
+            "error"
+          ],
           "additionalProperties": false
         }
       ]

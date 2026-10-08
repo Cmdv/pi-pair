@@ -12,6 +12,13 @@ export const stateSchema = Type.Object({
 	tasks: Type.Record(Type.String(), Type.Object({ agreedHash: hash, completedHash: hash }, { additionalProperties: false })),
 	/** The developer approved the spec as a whole; it holds while at least one task is agreed. */
 	specAgreed: Type.Boolean(),
+	/** Project roots outside this project the developer approved for this spec: Pair may edit files under them.
+	 * Optional for older state and test fixtures; absent means none, so the gate stays closed by default. */
+	externalRoots: Type.Optional(Type.Array(Type.String())),
+	/** The developer chose not to be asked again about stepping outside the project for this spec. */
+	externalMuted: Type.Optional(Type.Boolean()),
+	/** The files the developer last picked for this spec, remembered so the browser pre-checks them. Never a grant by itself. */
+	targets: Type.Optional(Type.Array(Type.String())),
 }, { additionalProperties: false });
 export type State = Static<typeof stateSchema>;
 

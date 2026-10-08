@@ -13,6 +13,10 @@ const contracts = (messages: any[]) => messages.map(text).filter((content) => co
 test("real Pi carries one live contract, blocks effects, writes only through pair_write and stops cleanly", async (t) => {
 	const cwd = mkdtempSync(join(tmpdir(), "pair-contract-runtime-"));
 	t.after(() => rmSync(cwd, { recursive: true, force: true }));
+	// No editor here: an inherited PI_PAIR_EDITOR (e.g. running inside Emacs) would rightly refuse every write.
+	const editor = process.env.PI_PAIR_EDITOR;
+	delete process.env.PI_PAIR_EDITOR;
+	t.after(() => { if (editor !== undefined) process.env.PI_PAIR_EDITOR = editor; });
 	const agentDir = join(cwd, "agent");
 	const spec = join(cwd, ".pi/pi-pair/specs/runtime.md");
 	const requests: any[][] = [];
@@ -96,7 +100,7 @@ test("real Pi carries one live contract, blocks effects, writes only through pai
 	assert.ok(notices.some((notice) => /State is not valid JSON.*Nothing was sent to the model/s.test(notice)));
 	assert.equal(session.messages.some((m) => m.role === "user" && text(m) === "Invalid state must fail closed."), false);
 
-	await session.prompt("/pair off");
+	await session.prompt("/pair:exit");
 	respond = async () => [{ type: "text", text: "Ordinary fixture response." }];
 	await session.prompt("Ordinary Pi after a clean stop.");
 	assert.equal(contracts(requests.at(-1)!).length, 0);

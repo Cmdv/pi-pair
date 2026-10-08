@@ -4,18 +4,21 @@ import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@e
 import pkg from "../package.json" with { type: "json" };
 import pair from "../src/index.ts";
 import { readyClassifier } from "./classifier-stub.ts";
-test("Pair restores on/off and leaves Pair no spec ungated", async () => {
+test("Pair restores on/off; while it is on, the model may not edit, and after Stop it is ordinary Pi", async () => {
 	const handlers = new Map<string, (...args: any[]) => any>();
 	let command!: Parameters<ExtensionAPI["registerCommand"]>[1];
+	let exit!: Parameters<ExtensionAPI["registerCommand"]>[1];
 	const messages: { content: unknown; options: unknown }[] = [];
 	let activeTools = ["read", "pair_show_code"];
 	const api: Partial<ExtensionAPI> = {
 		on(name, handler) { handlers.set(name, handler); return () => {}; },
-		registerCommand(name, options) { if (name === "pair") command = options; },
+		registerCommand(name, options) { if (name === "pair") command = options; if (name === "pair:exit") exit = options; },
 		registerTool() {},
 		registerMessageRenderer() {},
 		getActiveTools: () => activeTools,
 		setActiveTools(tools) { activeTools = tools; },
+		// Where each tool comes from: Pair trusts Pi's own read tools, not names.
+		getAllTools: () => [{ name: "read", sourceInfo: { source: "builtin", path: "<builtin:read>" } }] as any,
 		appendEntry() {},
 		sendMessage(message, options) { messages.push({ content: message.content, options }); },
 	};
@@ -38,21 +41,22 @@ test("Pair restores on/off and leaves Pair no spec ungated", async () => {
 	assert.equal(edit(), undefined);
 	await command.handler("", ctx);
 	assert.match(await prompt(), /^base\n\nPair is on without a spec/);
-	assert.equal(edit(), undefined);
+	assert.match(edit().reason, /^The developer drives this request/);
 	assert.ok(activeTools.includes("pair_ask"));
 	assert.equal(messages.length, 0);
 
 	idle = false;
-	await command.handler("off", ctx);
+	await exit.handler("", ctx);
 	assert.equal(await prompt(), undefined);
-	assert.match(String(messages[0].content), /Pair stopped/);
+	assert.match(String(messages[0].content), /Exited Pair/);
 	assert.deepEqual(messages[0].options, { triggerTurn: false });
 	assert.ok(!activeTools.includes("pair_ask"));
+	assert.equal(edit(), undefined); // Stopped: ordinary Pi again.
 	idle = true;
 	savedPair = true;
 	await handlers.get("session_start")!({}, ctx);
 	assert.match(await prompt(), /Pair is on without a spec/);
-	assert.equal(edit(), undefined);
+	assert.equal(edit().block, true);
 });
 
 test("adapter startup is opt-in, non-blocking, capability-driven and safe to reset", async (t) => {
@@ -73,6 +77,8 @@ test("adapter startup is opt-in, non-blocking, capability-driven and safe to res
 		getActiveTools: () => activeTools,
 		// pair_ask follows Pair alone; these lists track pair_show_code.
 		setActiveTools(tools) { asking = tools.includes("pair_ask"); activeTools = tools.filter((name) => name !== "pair_ask"); },
+		// Where each tool comes from: Pair trusts Pi's own read tools, not names.
+		getAllTools: () => [{ name: "read", sourceInfo: { source: "builtin", path: "<builtin:read>" } }] as any,
 	};
 	pair(api as ExtensionAPI, readyClassifier);
 
@@ -104,7 +110,7 @@ test("adapter startup is opt-in, non-blocking, capability-driven and safe to res
 	}
 	assert.equal(calls.length, 0);
 	assert.equal(warnings.length, 0);
-	assert.deepEqual(activeTools, ["read", "another_extension_tool"]);
+	assert.deepEqual(activeTools, ["read"]); // Pair is on: other extensions' tools are hidden.
 	assert.equal(asking, true); // Needs no adapter.
 
 	ctx.mode = "rpc";
@@ -119,13 +125,13 @@ test("adapter startup is opt-in, non-blocking, capability-driven and safe to res
 	reply(JSON.stringify(valid));
 	assert.doesNotMatch(await prompt(), /cite path:line/);
 	assert.equal(warnings.length, 0);
-	assert.deepEqual(activeTools, ["read", "another_extension_tool", "pair_show_code"]);
+	assert.deepEqual(activeTools, ["read", "pair_show_code"]);
 
 	input = async () => JSON.stringify({ ...valid, capabilities: ["clear"] });
 	start();
 	assert.match(await prompt(), /cite path:line/);
 	assert.equal(warnings.length, 0); // A valid adapter without annotations is not an error.
-	assert.deepEqual(activeTools, ["read", "another_extension_tool"]);
+	assert.deepEqual(activeTools, ["read"]);
 
 	for (const response of [undefined, "not JSON", JSON.stringify({ ...valid, version: 2 })]) {
 		input = async () => response;

@@ -35,18 +35,21 @@ export const writeScope = (scope: Triage["scope"]): WriteScope | undefined =>
 const schema = (name: string, question: string, labels: Record<string, string>, picked: readonly string[], task?: string): DecisionSchema =>
 	({ name, question: `Task under review: ${task || "none"}. ${question}`, labels: Object.fromEntries(picked.map((label) => [label, labels[label]])) });
 
+/** One dimension: a label the classifier is confident of, or "unclear". Throws on failure; callers treat that as unclear. */
+export async function choose(classifier: Pick<Classifier, "classify">, message: string, schema: DecisionSchema, signal?: AbortSignal) {
+	const labels = Object.keys(schema.labels);
+	// A single candidate is fixed by the workflow, not an interpretation of the reply.
+	const raw = labels.length === 1 ? decision([0], labels) : await classifier.classify(message, schema);
+	signal?.throwIfAborted();
+	return labels.includes(raw.choice) && raw.confidence >= CUTOFF ? raw.choice : "unclear";
+}
+
 /** Dimensions are scored independently, so "add an edge case to task 1" keeps both halves.
  * Any failure, including an oversized message, is reported as unclear rather than thrown. */
 export async function triage(classifier: Pick<Classifier, "classify">, message: string,
 	options: { scopes?: Scope[]; task?: string } = {}, signal?: AbortSignal): Promise<Triage> {
 	const scopes = options.scopes ?? scopesFor(options.task);
-	const pick = async (schema: DecisionSchema) => {
-		const labels = Object.keys(schema.labels);
-		// A single candidate is fixed by the workflow, not an interpretation of the reply.
-		const raw = labels.length === 1 ? decision([0], labels) : await classifier.classify(message, schema);
-		signal?.throwIfAborted();
-		return labels.includes(raw.choice) && raw.confidence >= CUTOFF ? raw.choice : "unclear";
-	};
+	const pick = (schema: DecisionSchema) => choose(classifier, message, schema, signal);
 	try {
 		signal?.throwIfAborted();
 		return {

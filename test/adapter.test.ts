@@ -107,7 +107,9 @@ test("annotation and clear payloads and replies are validated before recording s
 	for (const ranges of [[], [{ ...range, path: "../x" }], [{ ...range, end_line: 1 }], [{ ...range, note: "no" }], [{ path: "a", start_line: 1 }]]) {
 		await assert.rejects(show(send, ranges as never));
 	}
-	for (const paths of [[], ["a.md", "a.md"], ["../a.md"], ["/a.md"]]) {
+	// buffer_state now also carries an absolute path for an approved external target; a relative escape is still rejected.
+	// (An absolute path passing the schema is exercised end-to-end against the real editor in emacs.test.ts.)
+	for (const paths of [[], ["a.md", "a.md"], ["../a.md"]]) {
 		await assert.rejects(bufferState(send, paths), /Invalid buffer_state paths/);
 	}
 	for (const selection of [{}, { all: false }, { ids: [] }, { ids: ["x", "x"] }, { ids: ["x"], all: true }]) {

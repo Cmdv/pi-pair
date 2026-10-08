@@ -73,7 +73,7 @@ export async function open(send: Send, path: string, signal?: AbortSignal): Prom
 
 /** Whether each path is open and modified in the editor, in request order. */
 export async function bufferState(send: Send, paths: string[], signal?: AbortSignal): Promise<BufferState[]> {
-	checked(bufferStateSchema, { paths }, "Invalid buffer_state paths: use unique project-relative paths.");
+	checked(bufferStateSchema, { paths }, "Invalid buffer_state paths: use unique non-empty paths.");
 	const { buffers } = checked(bufferStateReplySchema, await call(send, "buffer_state", { paths }, signal),
 		"Invalid adapter buffer_state reply.");
 	if (buffers.length !== paths.length || buffers.some((buffer, i) => buffer.path !== paths[i])) {

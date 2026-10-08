@@ -52,7 +52,7 @@ From a checkout, use `pi install ./pi-pair` or, for one session,
   Only specs with a `.state.json` companion are listed; old-format Markdown
   stays hidden until converted.
 - `/pair <name>` opens or creates that spec directly.
-- `/pair off` returns to ordinary Pi.
+- `/pair:exit` leaves Pair and returns to ordinary Pi.
 
 The badge identifies the spec, the open task and how many tasks are agreed.
 Pair and the selected spec are saved with the session. **Pair no spec** enables
@@ -151,7 +151,7 @@ one line of shortcuts. Keys leave any chat draft untouched:
 |---|---|---|
 | `/pair:approve` | `C-c C-a` | Agree the task being reviewed, or the spec from the task list |
 | `/pair:tasks` | `C-c C-l` | Open the task list from anywhere |
-| `/pair off` | `C-c C-x` | Abort active Pair work and restore ordinary Pi |
+| `/pair:exit` | `C-c C-x` | Exit Pair: abort its active work and restore ordinary Pi |
 
 Approve is offered only when something can be approved: a written task, or the
 spec once at least one task is agreed. Ordinary RET stays chat, and a

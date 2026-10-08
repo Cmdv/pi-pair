@@ -21,6 +21,8 @@ test("annotations are capability-gated, acknowledged before persistence and safe
 		// pair_ask follows Pair alone; these lists track pair_show_code.
 		setActiveTools(tools) { asking = tools.includes("pair_ask"); activeTools = tools.filter((name) => name !== "pair_ask"); },
 		appendEntry(type, data) { entries.push({ type, data }); },
+		// Where each tool comes from: Pair trusts Pi's own read tools, not names.
+		getAllTools: () => [{ name: "read", sourceInfo: { source: "builtin", path: "<builtin:read>" } }] as any,
 	};
 	pair(api as ExtensionAPI, readyClassifier);
 
@@ -57,7 +59,7 @@ test("annotations are capability-gated, acknowledged before persistence and safe
 	const annotations = () => entries.filter((entry) => entry.type === "pi-pair-annotation");
 
 	await start();
-	assert.deepEqual(activeTools, ["read", "another_tool", "pair_show_code"]);
+	assert.deepEqual(activeTools, ["read", "pair_show_code"]); // Pair on: other extensions' tools are hidden.
 	assert.equal(asking, true);
 	assert.equal(handlers.get("tool_call")!({ toolName: "pair_show_code", input: {} }, ctx), undefined);
 	const result = await run();
@@ -80,7 +82,7 @@ test("annotations are capability-gated, acknowledged before persistence and safe
 	assert.equal(calls.length, beforeInvalid);
 	capabilities = ["show"];
 	await start();
-	assert.deepEqual(activeTools, ["read", "another_tool", "pair_show_code"]);
+	assert.deepEqual(activeTools, ["read", "pair_show_code"]);
 	const before = entries.length;
 	assert.deepEqual((await call(shown)).details, { ranges: [{ path: "src/two.ts", start_line: 7, end_line: 7 }] });
 	assert.deepEqual(calls.at(-1), { method: "show", args: { ranges: [{ path: "src/two.ts", start_line: 7, end_line: 7 }] } });
@@ -93,7 +95,7 @@ test("annotations are capability-gated, acknowledged before persistence and safe
 	assert.deepEqual(calls.at(-1), { method: "clear", args: { ids: [note.id] } });
 	assert.deepEqual(entries.at(-1), { type: "pi-pair-clear", data: { ids: [note.id] } });
 	const count = calls.length;
-	await commands.get("pair")!.handler("off", ctx);
+	await commands.get("pair:exit")!.handler("", ctx);
 	assert.equal(asking, false);
 	assert.equal(calls.length, count); // Off hides the tool, but does not clear existing notes.
 	assert.deepEqual(activeTools, ["read", "another_tool"]);
@@ -131,7 +133,7 @@ test("annotations are capability-gated, acknowledged before persistence and safe
 	response = async () => '{"ok":true}';
 	capabilities = ["annotate"];
 	await start();
-	assert.deepEqual(activeTools, ["read", "another_tool"]);
+	assert.deepEqual(activeTools, ["read"]);
 	await assert.rejects(run(), /does not support present/);
 	const beforeMissingClear = calls.length;
 	await clear("all");
@@ -139,7 +141,7 @@ test("annotations are capability-gated, acknowledged before persistence and safe
 	assert.match(String(notices.at(-1)![0]), /does not support clear/);
 	capabilities = ["clear"]; 
 	await start();
-	assert.deepEqual(activeTools, ["read", "another_tool"]);
+	assert.deepEqual(activeTools, ["read"]);
 	await assert.rejects(run(), /does not support present/);
 
 	capabilities = ["present", "clear"];
@@ -155,6 +157,6 @@ test("annotations are capability-gated, acknowledged before persistence and safe
 	acknowledge('{"ok":true}');
 	await assert.rejects(pending, /abort/i);
 	assert.equal(annotations().length, beforeLateReply);
-	assert.deepEqual(activeTools, ["read", "another_tool"]);
+	assert.deepEqual(activeTools, ["read"]);
 	delete process.env.PI_PAIR_EDITOR;
 });

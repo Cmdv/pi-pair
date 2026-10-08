@@ -43,9 +43,12 @@ test("Emacs schema conformance and real core RPC handshake/clear, without a mode
 	cases.push({ method: "buffer_state", args: { paths: ["code.txt", "missing.txt"] }, valid: true, count: 3, buffers: [
 		{ path: "code.txt", open: true, modified: true }, { path: "missing.txt", open: false, modified: false },
 	] });
-	for (const paths of [[], ["code.txt", "code.txt"], ["../x"], ["/etc/passwd"]]) {
+	for (const paths of [[], ["code.txt", "code.txt"], ["../x"]]) {
 		cases.push({ method: "buffer_state", args: { paths }, valid: false, count: 3 });
 	}
+	// An absolute path is an approved external target: accepted, and its open/modified state reported, never visited.
+	cases.push({ method: "buffer_state", args: { paths: [join(cwd, "code.txt")] }, valid: true, count: 3,
+		buffers: [{ path: join(cwd, "code.txt"), open: true, modified: true }] });
 	// A valid ask waits for the developer, so only rejections replay here.
 	const question = { label: "Scope", question: "Which files?", options: ["src", "all"] };
 	for (const questions of [[], Array(6).fill(question), [{ ...question, label: "A label far too long" }], [{ ...question, options: Array(6).fill("src") }], [{ ...question, extra: true }]]) {

@@ -6,7 +6,9 @@
        (replies-file (pop command-line-args-left))
        (cli (pop command-line-args-left))
        (core (pop command-line-args-left))
-       (session (pi-session--make :directory default-directory))
+       ;; A chat input on screen, as in a real session: code opens beside it, and focus stays there.
+       (input (switch-to-buffer (get-buffer-create "*pi input: replay*")))
+       (session (pi-session--make :directory default-directory :input input))
        (source (find-file-noselect (expand-file-name "code.txt")))
        (requests (with-temp-buffer
                    (insert-file-contents requests-file)

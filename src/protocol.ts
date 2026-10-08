@@ -42,8 +42,11 @@ export const showSchema = Type.Object({
 }, { additionalProperties: false });
 
 export const openSchema = Type.Object({ path: Type.Unsafe<string>(fields.path) }, { additionalProperties: false });
+// buffer_state only reports open/modified, so a path is project-relative (inside the project) or absolute
+// (a developer-approved external target, which has no project-relative form). A relative escape is still refused.
 export const bufferStateSchema = Type.Object({
-	paths: Type.Array(Type.Unsafe<string>(fields.path), { minItems: 1, uniqueItems: true }),
+	paths: Type.Array(Type.Union([Type.Unsafe<string>(fields.path), Type.String({ pattern: "^/" })]),
+		{ minItems: 1, uniqueItems: true }),
 }, { additionalProperties: false });
 export const bufferStateReplySchema = Type.Unsafe<{ ok: true; buffers: BufferState[] }>(wire.$defs.bufferStateReply);
 

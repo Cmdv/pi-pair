@@ -75,6 +75,10 @@ test("real Pi RPC starts and falls back without any model calls", async (t) => {
 							if (event.type === "extension_ui_request" && event.method === "select" && event.title === "Pair") {
 								send({ type: "extension_ui_response", id: event.id, value: "Pair no spec" });
 							}
+							// Entering Pair asks how to pair, in code; the first preset is Guide me.
+							if (event.type === "extension_ui_request" && event.method === "select" && event.title.startsWith("Pair settings")) {
+								send({ type: "extension_ui_response", id: event.id, value: event.options[0] });
+							}
 							if (event.type === "extension_ui_request" && event.title === "pi-pair:v1:clear") {
 								assert.equal(event.method, "input");
 								assert.deepEqual(JSON.parse(event.placeholder), { all: true });
@@ -112,7 +116,8 @@ test("real Pi RPC starts and falls back without any model calls", async (t) => {
 			assert.equal(warnings.length, expectsWarning ? 1 : 0);
 			if (expectsWarning) assert.match(warnings[0].message, /Pairing adapter unavailable/);
 			if (response === "wrong-id") assert.match(warnings[0].message, /cancelled or timed out/);
-			assert.ok(events.some((event) => event.statusKey === "pair" && event.statusText === "🧑‍🤝‍🧑 Pair"));
+			assert.ok(events.some((event) => event.statusKey === "pair" && event.statusText === "🧑‍🤝‍🧑 Pair · you drive · hints"));
+			assert.ok(events.some((event) => event.type === "entry_appended" && event.entry.customType === "pi-pair" && event.entry.data.settings?.assistance === "hints"));
 			assert.equal(events.some((event) => event.type === "agent_start" || event.type === "extension_error"), false);
 		});
 	}

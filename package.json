@@ -16,7 +16,8 @@
     "check": "tsc --noEmit",
     "classifier": "node src/classifier-cli.ts",
     "classifier:setup": "node src/classifier-cli.ts setup",
-    "classifier:smoke": "node src/classifier-cli.ts smoke"
+    "classifier:smoke": "node src/classifier-cli.ts smoke",
+    "eval": "node test/pair-eval.ts"
   },
   "dependencies": {
     "@huggingface/tokenizers": "0.2.0"
