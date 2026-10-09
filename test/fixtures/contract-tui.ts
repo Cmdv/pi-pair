@@ -1,16 +1,12 @@
-/** Opt-in live TUI probe: a deterministic local LLM, optionally the real cached classifier. */
+/** Opt-in live TUI probe: a deterministic local LLM. */
 import { appendFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import pair from "../../src/index.ts";
-import { classifierPaths, loadClassifier } from "../../src/classifier.ts";
-import { classifierStub } from "../classifier-stub.ts";
 import { contractModel } from "./contract-model.ts";
 
 export default function (pi: ExtensionAPI) {
-	pair(pi, process.env.PI_PAIR_TEST_MODEL_ROOT
-		? ({ signal }) => loadClassifier(classifierPaths(process.env.PI_PAIR_TEST_MODEL_ROOT), signal)
-		: classifierStub({ scope: "this_task", operation: "discuss" }));
+	pair(pi);
 	contractModel(pi, async (messages, signal) => {
 		signal?.throwIfAborted();
 		if (process.env.PI_PAIR_TEST_TRANSCRIPT) appendFileSync(process.env.PI_PAIR_TEST_TRANSCRIPT, JSON.stringify(messages) + "\n");

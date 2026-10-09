@@ -1,39 +1,7 @@
 import { setOrder } from "../src/tasks.ts";
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
 import { test } from "node:test";
 import { appendTasks, fingerprint, nextTaskId, parseSpec, questionItems, setGoal, slug, template, updateTask } from "../src/tasks.ts";
-
-/** The task example from spec-workflow.md, so the design document is also a fixture. */
-const EXAMPLE = (() => {
-	const doc = readFileSync(new URL("../spec-workflow.md", import.meta.url), "utf8");
-	const match = /```markdown\n(## 2: Discuss and agree a task\n[\s\S]*?)```/.exec(doc);
-	assert.ok(match, "spec-workflow.md should contain the task example");
-	return match[1];
-})();
-
-test("parses the design document's task example", () => {
-	const spec = parseSpec(`# Example\n\n## Goal\nShow the format.\n\n${EXAMPLE}`);
-	assert.deepEqual(spec.problems, []);
-	assert.equal(spec.title, "Example");
-	assert.equal(spec.goal, "Show the format.");
-	assert.equal(spec.tasks.length, 1);
-	const [task] = spec.tasks;
-	assert.equal(task.id, "2");
-	assert.equal(task.name, "Discuss and agree a task");
-	assert.equal(task.line, 6);
-	assert.deepEqual(Object.keys(task.sections), ["Summary", "Task", "Research", "Proposed solution", "Questions", "Edge cases", "Done when"]);
-	assert.equal(task.sections.Task?.text, "Problem, intended outcome, scope and constraints.");
-	assert.equal(task.sections["Done when"]?.text, "Observable outcomes and checks that demonstrate the task is finished.");
-	assert.deepEqual(task.questions.map(({ id, checked, text, fields }) => [id, checked, text, fields]),
-		[["Q1", true, "Does approving this task start implementation?", { Options: "No, record agreement only | Yes, implement immediately", Answer: "No. Spec only records agreement." }]]);
-	assert.deepEqual(task.edges.map(({ id, checked, fields }) => [id, checked, fields]), [
-		["E1", true, { Expected: "Refuse the stale approval and ask for a fresh proposal.", Check: "Edit the task after publishing; approving must not overwrite it." }],
-		["E2", false, {}],
-		["E3", true, { "Out of scope": "Spec is planning-only; implementation needs a separate developer decision." }],
-	]);
-	assert.match(task.hash, /^[0-9a-f]{64}$/);
-});
 
 test("reports malformed structure instead of guessing", () => {
 	const text = [

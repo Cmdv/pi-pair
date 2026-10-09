@@ -2,7 +2,6 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import pair from "../src/index.ts";
-import { readyClassifier } from "./classifier-stub.ts";
 import type { Annotation } from "../src/protocol.ts";
 
 test("annotations are capability-gated, acknowledged before persistence and safe across session changes", async () => {
@@ -19,12 +18,12 @@ test("annotations are capability-gated, acknowledged before persistence and safe
 		registerMessageRenderer() {}, sendMessage() {},
 		getActiveTools: () => activeTools,
 		// pair_ask follows Pair alone; these lists track pair_show_code.
-		setActiveTools(tools) { asking = tools.includes("pair_ask"); activeTools = tools.filter((name) => name !== "pair_ask"); },
+		setActiveTools(tools) { asking = tools.includes("pair_ask"); activeTools = tools.filter((name) => name !== "pair_ask" && name !== "pair_profile"); },
 		appendEntry(type, data) { entries.push({ type, data }); },
 		// Where each tool comes from: Pair trusts Pi's own read tools, not names.
 		getAllTools: () => [{ name: "read", sourceInfo: { source: "builtin", path: "<builtin:read>" } }] as any,
 	};
-	pair(api as ExtensionAPI, readyClassifier);
+	pair(api as ExtensionAPI);
 
 	let capabilities = ["present", "annotate", "clear"]; 
 	let showWhenOff: boolean | undefined;

@@ -8,7 +8,7 @@ const RECOMMENDED = " (recommended)";
 
 /** Options as the developer sees them: the first is the model's recommendation, so it says so. */
 export const labelled = (options: string[]) =>
-	options.map((text, i) => i === 0 && !/recommend/i.test(text) ? text + RECOMMENDED : text);
+	options.map((text, i) => i === 0 && !/recommend|\((current|proposed)\)$/i.test(text) ? text + RECOMMENDED : text);
 /** The option behind a label, so an answer reads back as the model wrote it. */
 export const chosen = (text: string) => text.endsWith(RECOMMENDED) ? text.slice(0, -RECOMMENDED.length) : text;
 

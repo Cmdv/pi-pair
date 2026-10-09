@@ -10,6 +10,8 @@ import pkg from "../package.json" with { type: "json" };
 const cli = fileURLToPath(new URL("cli.js", import.meta.resolve("@earendil-works/pi-coding-agent")));
 const extension = fileURLToPath(new URL("./fixtures/offline-extension.ts", import.meta.url));
 
+const PROFILE = ["Who writes the code?", "How much help while you drive?", "When does Pair stop for you?"];
+
 test("real Pi RPC starts and falls back without any model calls", async (t) => {
 	for (const response of ["no-adapter", "valid", "invalid", "cancelled", "wrong-id"] as const) {
 		await t.test(response, { timeout: 20000 }, async (t) => {
@@ -75,8 +77,8 @@ test("real Pi RPC starts and falls back without any model calls", async (t) => {
 							if (event.type === "extension_ui_request" && event.method === "select" && event.title === "Pair") {
 								send({ type: "extension_ui_response", id: event.id, value: "Pair no spec" });
 							}
-							// Entering Pair asks how to pair, in code; the first preset is Guide me.
-							if (event.type === "extension_ui_request" && event.method === "select" && event.title.startsWith("Pair settings")) {
+							// Entering Pair asks for the profile, in code, a tab at a time; the current values come first.
+							if (event.type === "extension_ui_request" && event.method === "select" && PROFILE.includes(event.title)) {
 								send({ type: "extension_ui_response", id: event.id, value: event.options[0] });
 							}
 							if (event.type === "extension_ui_request" && event.title === "pi-pair:v1:clear") {
@@ -117,7 +119,8 @@ test("real Pi RPC starts and falls back without any model calls", async (t) => {
 			if (expectsWarning) assert.match(warnings[0].message, /Pairing adapter unavailable/);
 			if (response === "wrong-id") assert.match(warnings[0].message, /cancelled or timed out/);
 			assert.ok(events.some((event) => event.statusKey === "pair" && event.statusText === "🧑‍🤝‍🧑 Pair · you drive · hints"));
-			assert.ok(events.some((event) => event.type === "entry_appended" && event.entry.customType === "pi-pair" && event.entry.data.settings?.assistance === "hints"));
+			assert.deepEqual(events.filter((event) => event.method === "select" && PROFILE.includes(event.title)).map((event) => event.options[0]),
+				["You (current)", "Hints (current)", "Each step (current)"]);
 			assert.equal(events.some((event) => event.type === "agent_start" || event.type === "extension_error"), false);
 		});
 	}

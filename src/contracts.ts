@@ -4,13 +4,15 @@ import type { Snapshot } from "./proposals.ts";
 
 export const CONTRACT = "pi-pair-contract";
 export const READ_TOOLS = ["read", "grep", "find", "ls"];
+// pi-web-access's default tool names, including its optional lazy loader.
+export const WEB_TOOLS = ["web_enable", "web_search", "source_check", "fetch_content", "get_search_content"];
 export const WRITE = "pair_write";
 
 /** What the model may write this turn: only new tasks and the goal, only the selected task, or any task. */
 export type Scope = "tasks" | "task" | "any";
 export type Phase = "describe" | "populate" | "review" | "spec";
-/** Triage of the developer's last message: where they are pointing, and what they want done. */
-export type Intent = { scope?: Scope; operation?: string };
+/** Where the developer typed a change: the task list, or one task. */
+export type Intent = { scope?: Scope };
 
 /** The Summary is what the developer reads in the task's dialog; the questions are what code puts to them there. */
 const QUESTIONS = "Summary is two or three lines the developer reads first, enough to decide on the task without reading the rest. Only write a question when the developer must decide something reading the code cannot settle, one per line as `- [ ] Q1: ...` with up to five short likely answers on the next line as `  - Options: a | b | c`, your recommendation first; leave Questions empty otherwise. The task opens on its Summary; code asks these questions with their options only when the developer chooses Answer open questions, and records what they choose.";
@@ -30,7 +32,6 @@ export function contractFor(snapshot: Snapshot, selection?: string, intent?: Int
 	const write: Scope = phase === "describe" ? "any" : phase === "populate" ? "task" : intent?.scope ?? (task ? "task" : "any");
 	return {
 		phase, task: task?.id ?? null, write,
-		...(intent?.operation && intent.operation !== "unclear" ? { developerWants: intent.operation } : {}),
 		tools: [...READ_TOOLS, "pair_ask", "pair_show_code", WRITE],
 		instruction: INSTRUCTION[phase],
 		// The spec's content is here, not in a file the model reads: the file is the developer's view.
@@ -54,7 +55,7 @@ export function allowsWrite(contract: Contract, input?: Record<string, unknown>)
 
 export function guidance(contract: Contract) {
 	return `Pair Spec turn contract\n${JSON.stringify(contract, null, 2)}\n` +
-		"Write only what this contract's scope allows, through pair_write. The spec's content is in this contract: never read the files under .pi/pi-pair. " +
+		"Write only what this contract's scope allows, through pair_write; a write outside it asks the developer first, so make one only when they asked for it. The spec's content is in this contract: never read the files under .pi/pi-pair. " +
 		"Never implement, run shell commands, delegate or edit files. " +
 		"Writing content is not agreement: only the developer's explicit approval agrees a task or the spec.";
 }

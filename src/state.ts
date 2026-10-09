@@ -8,6 +8,13 @@ import { Value } from "typebox/value";
 import { REQUIRED, type Problem, type Section, type Spec } from "./tasks.ts";
 
 const hash = Type.Union([Type.String({ minLength: 1 }), Type.Null()]);
+/** The developer's Pair profile for this spec, the latest choice. Outside the agreement hashes, and never a grant. */
+export const profileSchema = Type.Object({
+	driver: Type.Union([Type.Literal("human"), Type.Literal("model")]),
+	assistance: Type.Union([Type.Literal("hints"), Type.Literal("examples"), Type.Literal("solution")]),
+	checkpoint: Type.Union([Type.Literal("each_step"), Type.Literal("after_slice")]),
+}, { additionalProperties: false });
+export type Profile = Static<typeof profileSchema>;
 export const stateSchema = Type.Object({
 	tasks: Type.Record(Type.String(), Type.Object({ agreedHash: hash, completedHash: hash }, { additionalProperties: false })),
 	/** The developer approved the spec as a whole; it holds while at least one task is agreed. */
@@ -15,10 +22,11 @@ export const stateSchema = Type.Object({
 	/** Project roots outside this project the developer approved for this spec: Pair may edit files under them.
 	 * Optional for older state and test fixtures; absent means none, so the gate stays closed by default. */
 	externalRoots: Type.Optional(Type.Array(Type.String())),
-	/** The developer chose not to be asked again about stepping outside the project for this spec. */
+	/** Kept so older state files load; nothing reads it now. */
 	externalMuted: Type.Optional(Type.Boolean()),
-	/** The files the developer last picked for this spec, remembered so the browser pre-checks them. Never a grant by itself. */
+	/** Kept so older state files load; never a grant, and nothing reads it now. */
 	targets: Type.Optional(Type.Array(Type.String())),
+	profile: Type.Optional(profileSchema),
 }, { additionalProperties: false });
 export type State = Static<typeof stateSchema>;
 

@@ -92,6 +92,15 @@ test("an approved external root widens the gate to that project only, keeping sy
 	assert.equal(checkWrite(slice, join(outside, "lib/mod.ts"), "edit"), join(realOutside, "lib/mod.ts"));
 	assert.throws(() => checkWrite(slice, join(outside, "secret.txt"), "edit"), /is not a file confirmed for this slice/);
 	assert.throws(() => openSlice(root, [join(outside, "lib/mod.ts")]), /outside the project/); // No approval, no slice.
+	// Another project's Pair files are its developer's: refused even under an approved root.
+	mkdirSync(join(outside, ".pi/pi-pair/specs"), { recursive: true });
+	writeFileSync(join(outside, ".pi/pi-pair/specs/theirs.md"), "# Theirs\n");
+	assert.equal(landing(root, join(outside, ".pi/pi-pair/specs/theirs.md"), roots), undefined);
+	assert.equal(landing(root, join(outside, ".pi/pi-pair/new.md"), roots), undefined);
+	// More files join a slice with their own baseline; one already in it keeps the one it had.
+	writeFileSync(join(outside, "lib/mod.ts"), "export const changed = 1;\n");
+	openSlice(root, [join(outside, "lib/mod.ts"), join(outside, "lib/more.ts")], roots, slice);
+	assert.deepEqual([...slice.before.values()], ["export {};\n", null]);
 });
 
 test("a changed span encloses every changed line of the model's version, and is honest about removals and emptied files", () => {

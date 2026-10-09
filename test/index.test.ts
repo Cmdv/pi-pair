@@ -3,7 +3,6 @@ import { test } from "node:test";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import pkg from "../package.json" with { type: "json" };
 import pair from "../src/index.ts";
-import { readyClassifier } from "./classifier-stub.ts";
 test("Pair restores on/off; while it is on, the model may not edit, and after Stop it is ordinary Pi", async () => {
 	const handlers = new Map<string, (...args: any[]) => any>();
 	let command!: Parameters<ExtensionAPI["registerCommand"]>[1];
@@ -22,7 +21,7 @@ test("Pair restores on/off; while it is on, the model may not edit, and after St
 		appendEntry() {},
 		sendMessage(message, options) { messages.push({ content: message.content, options }); },
 	};
-	pair(api as ExtensionAPI, readyClassifier);
+	pair(api as ExtensionAPI);
 
 	let idle = true;
 	let savedPair = false;
@@ -41,7 +40,7 @@ test("Pair restores on/off; while it is on, the model may not edit, and after St
 	assert.equal(edit(), undefined);
 	await command.handler("", ctx);
 	assert.match(await prompt(), /^base\n\nPair is on without a spec/);
-	assert.match(edit().reason, /^The developer drives this request/);
+	assert.match(edit().reason, /^The developer drives: suggest the change for them to make/);
 	assert.ok(activeTools.includes("pair_ask"));
 	assert.equal(messages.length, 0);
 
@@ -57,6 +56,34 @@ test("Pair restores on/off; while it is on, the model may not edit, and after St
 	await handlers.get("session_start")!({}, ctx);
 	assert.match(await prompt(), /Pair is on without a spec/);
 	assert.equal(edit().block, true);
+});
+
+test("Pair adds Pi's discovery tools to the default loadout and keeps bash available", async () => {
+	const handlers = new Map<string, (...args: any[]) => any>();
+	let command!: Parameters<ExtensionAPI["registerCommand"]>[1];
+	let activeTools = ["read", "bash", "edit", "write"];
+	const builtin = ["read", "ls", "find", "grep", "bash", "edit", "write"].map((name) => ({ name, sourceInfo: { source: "builtin", path: `<builtin:${name}>` } }));
+	const api: Partial<ExtensionAPI> = {
+		on(name, handler) { handlers.set(name, handler); return () => {}; },
+		registerCommand(name, options) { if (name === "pair") command = options; },
+		registerTool() {},
+		registerMessageRenderer() {},
+		getActiveTools: () => activeTools,
+		setActiveTools(tools) { activeTools = tools; },
+		getAllTools: () => builtin as any,
+		appendEntry() {},
+		sendMessage() {},
+	};
+	pair(api as ExtensionAPI);
+	const ctx = {
+		cwd: "/no-project", hasUI: true, isIdle: () => true, hasPendingMessages: () => false, abort() {}, waitForIdle: async () => {},
+		sessionManager: { getSessionId: () => "test", getBranch: () => [] },
+		ui: { setStatus() {}, notify() {}, select: async () => "Pair no spec" },
+	} as unknown as ExtensionCommandContext;
+	await handlers.get("session_start")!({}, ctx);
+	await command.handler("", ctx);
+	for (const name of ["read", "ls", "find", "grep", "bash"]) assert.ok(activeTools.includes(name), name);
+	for (const name of ["edit", "write"]) assert.ok(!activeTools.includes(name), name);
 });
 
 test("adapter startup is opt-in, non-blocking, capability-driven and safe to reset", async (t) => {
@@ -76,11 +103,11 @@ test("adapter startup is opt-in, non-blocking, capability-driven and safe to res
 		registerMessageRenderer() {},
 		getActiveTools: () => activeTools,
 		// pair_ask follows Pair alone; these lists track pair_show_code.
-		setActiveTools(tools) { asking = tools.includes("pair_ask"); activeTools = tools.filter((name) => name !== "pair_ask"); },
+		setActiveTools(tools) { asking = tools.includes("pair_ask"); activeTools = tools.filter((name) => name !== "pair_ask" && name !== "pair_profile"); },
 		// Where each tool comes from: Pair trusts Pi's own read tools, not names.
 		getAllTools: () => [{ name: "read", sourceInfo: { source: "builtin", path: "<builtin:read>" } }] as any,
 	};
-	pair(api as ExtensionAPI, readyClassifier);
+	pair(api as ExtensionAPI);
 
 	const valid = { version: 1, editor: "any-editor", capabilities: ["present"] };
 	let input: ExtensionContext["ui"]["input"] = async () => JSON.stringify(valid);

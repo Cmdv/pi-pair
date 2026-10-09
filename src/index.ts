@@ -1,25 +1,27 @@
-import { appendFileSync, constants, existsSync, mkdirSync, readdirSync, realpathSync, writeFileSync } from "node:fs";
+import { appendFileSync, constants, existsSync, mkdirSync, readdirSync, realpathSync, statSync, writeFileSync } from "node:fs";
 import { access, mkdir, readFile } from "node:fs/promises";
-import { dirname, join, relative, resolve, sep } from "node:path";
+import { join, relative, resolve, sep } from "node:path";
+import { Type } from "typebox";
 import { createEditToolDefinition, createWriteToolDefinition, withFileMutationQueue, type ExtensionAPI, type ExtensionCommandContext,
 	type ExtensionContext, type MessageStartEvent, type ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { Box, Spacer, Text } from "@earendil-works/pi-tui";
 import { answeredQuestions, findTask, optionsOf, slug, summaryOf, template } from "./tasks.ts";
 import { emptyState, stateFile, writeState, type Status, type TaskStatus } from "./state.ts";
 import { apply, loadSpec as loadFile, save, writeParameters } from "./proposals.ts";
-import { classifierFactory, type Classifier, type ClassifierFactory } from "./classifier.ts";
-import { allowsWrite, CONTRACT, contractFor, guidance, READ_TOOLS, WRITE, type Contract, type Intent } from "./contracts.ts";
-import { triage, writeScope } from "./triage.ts";
+import { allowsWrite, CONTRACT, contractFor, guidance, READ_TOOLS, WEB_TOOLS, WRITE, type Contract, type Intent } from "./contracts.ts";
 import { ask as askEditor, bufferState, handshake, open as openEditor, rpcTransport } from "./adapter.ts";
 import { NEEDS, SHOW_CODE, registerShow, type Connected } from "./show.ts";
 import { answerText, askEach, askParameters, askTabs, type Answers, type Question } from "./ask.ts";
-import { CHECKPOINTS, describe, DRIVERS, GUIDE_ME, HELP, parseTargets, PRESETS, presetOf, readSettings, type Settings } from "./settings.ts";
-import { arrange, pairContract, pairGuidance, propose, TASK_START, UNCLEAR, type Request } from "./requests.ts";
+import { CHECKPOINTS, describe, profileFrom, profileParameters, profileQuestions, STARTING, type Profile } from "./settings.ts";
+import { pairContract, pairGuidance, type Request } from "./requests.ts";
 import { changedSpans, changes, checkWrite, confirmedParent, landing, openSlice, recordWrite, within } from "./effects.ts";
 import pkg from "../package.json" with { type: "json" };
 
 const ENTRY = "pi-pair";
 const ASK = "pair_ask";
+const PROFILE = "pair_profile";
+const FILES = "pair_files";
+const REPORT = "pair_report";
 const HOME = join(".pi", "pi-pair");
 const SPECS = join(HOME, "specs");
 const TRACE = join(HOME, "trace.log"); // Readable alongside the specs: what code decided, and what it refused.
@@ -39,11 +41,9 @@ const MARK_DONE = "Mark task as done";
 const RESET_TASK = "Reset task";
 const GO_BACK = "Go back";
 const CANCEL = "Cancel";
-const ADJUST_SETTINGS = "Adjust driver, help and check-ins…";
+const SHOW_SPEC = "Show spec file";
 const CONFIRM = "Confirm";
-const CHOOSE_FILES = "Choose files…";
-const PICK_EXTERNAL = "Select files/dirs outside the project";
-const DONT_ASK = "No — and don't ask again for this spec";
+const ALLOW_WRITE = "Allow this write";
 const OPENING = "What are you trying to solve?";
 const SOURCE_TOOLS = ["edit", "write"];
 const STOP = "Pair has no readable spec. Report the problem and wait; do not call tools.";
@@ -54,24 +54,26 @@ const messageText = (message: Message) => "content" in message ? typeof message.
 const strings = (value: unknown): string[] =>
 	typeof value === "string" ? [value] : value && typeof value === "object" ? Object.values(value).flatMap(strings) : [];
 /** What code does once the model's turn has settled; derived from what was written, so repeated writes agree. */
-type Next = "tasks" | "task";
+type Next = "tasks" | "task" | "progress";
+/** The model's hand-back: it reports a slice implemented or blocked, and code returns to the task. It never completes the task. */
+type Report = { task: string; status: "implemented" | "blocked"; summary: string };
 
 /** Pair is on or off, with an optional spec. PI_PAIR_EDITOR separately opts into adapter discovery. */
-export default function (pi: ExtensionAPI, factory: ClassifierFactory = classifierFactory) {
+export default function (pi: ExtensionAPI) {
 	let pair = false;
 	let spec: string | undefined;
 	let selection: string | undefined; // The task being filled in or reviewed; none means the task list.
-	let intent: Intent | undefined; // The last triage result, which scopes what the model may write.
+	let intent: Intent | undefined; // Where the developer typed a change, which scopes what the model may write.
 	let next: Next | undefined;
-	let requested: string | undefined; // A change request from our dialog is already scoped; do not triage it again.
+	let report: Report | undefined; // The last pair_report, read once by agent_settled so the return is one dialog.
+	let requested: string | undefined; // A change request from our dialog, already scoped by where it was typed.
 	let revision = 0; // Any scope change invalidates a picker or dialog that is already open.
-	let classifier: Classifier | undefined;
-	let classifierFailed = false;
 	let ready = false; // The spec is approved: Pair works on it, and the spec machinery stands down.
-	let settings: Settings | undefined; // Confirmed preferences; none means Guide me until the developer chooses.
-	// Ordinary Pair's requests: resolved when they arrive, served once Pi delivers them, and never saved.
+	let profile: Profile | undefined; // The spec's saved profile, or the session's without one; none until the developer chooses.
+	let loose: Profile | undefined; // Without a spec the profile lives in memory, for this session only.
+	// Ordinary Pair's requests: recorded when they arrive, served once Pi delivers them, and never saved.
 	let pending: Request[] = [];
-	let serving: Request | undefined; // The request the model is working on now; its slice, if any, is the only edit grant.
+	let serving: Request | undefined; // The request the model is working on now; its confirmed files, if any, are the only edit grant.
 	let requests = 0;
 	let waiting: "confirm" | "review" | undefined; // Shown in the status, nothing more.
 	let traced: string | undefined; // The session the trace log is on, so separate runs read apart.
@@ -81,19 +83,21 @@ export default function (pi: ExtensionAPI, factory: ClassifierFactory = classifi
 	let whenOff = false;
 	let loadout: string[] | undefined; // The developer's own active tools, kept while Pair narrows them and given back after.
 
-	const preferred = () => settings ?? GUIDE_ME;
-	/** Anything resolved before Pair last changed (Stop, settings, task, session) grants nothing. */
+	const preferred = () => profile ?? STARTING;
+	/** Anything resolved before Pair last changed (Stop, task, session) grants nothing. */
 	const stale = (request: Request) => request.generation !== revision;
 	const grant = () => serving && !stale(serving) && !serving.paused && serving.files?.length && serving.slice ? serving : undefined;
-	// Every entry is a full snapshot, so selecting a task never drops the settings.
-	const snapshot = () => ({ pair, spec, selection, ...(settings ? { settings } : {}) });
-	/** Who has the keyboard now, what they prefer, how much help, and whether Pair is waiting on them. */
+	// The profile lives with the spec, not the session, so a task picked up in a new session needs no choosing again.
+	const snapshot = () => ({ pair, spec, selection });
+	const savedProfile = (ctx: ExtensionContext) => { try { return spec ? loadSpec(ctx.cwd).state.profile : undefined; } catch { return undefined; } };
+	/** Who drives, and the part of the profile that applies to them; then whether the model has files or Pair waits on the developer.
+	 * Q1: assistance is what the developer gets while they drive, so the model driving shows its checkpoint instead. */
 	const arrangement = () => {
-		const { driver } = preferred();
-		// Help is this request's, which may differ from the default when the developer asked for more or less.
-		const { assistance } = serving && !stale(serving) ? serving : preferred();
-		return [grant() ? "model driving this slice" : driver === "model" ? "you drive · model preferred" : "you drive", assistance,
-			...(waiting === "confirm" ? ["confirm slice"] : waiting === "review" ? ["review"] : [])].join(" · ");
+		const { driver, assistance, checkpoint } = preferred();
+		const live = grant()?.files?.length;
+		return [...(driver === "human" ? ["you drive", assistance] : ["model driving", CHECKPOINTS[checkpoint].toLowerCase()]),
+			...(live ? [`${live} file${live === 1 ? "" : "s"} confirmed`] : []),
+			...(waiting === "confirm" ? ["confirm files"] : waiting === "review" ? ["review"] : [])].join(" · ");
 	};
 	// An editor that reports showWhenOff keeps showing code after Pair stops.
 	const showing = () => pair || whenOff;
@@ -149,7 +153,7 @@ export default function (pi: ExtensionAPI, factory: ClassifierFactory = classifi
 		ctx.ui.setStatus("pair", pair ? `🧑‍🤝‍🧑 ${where}` : undefined);
 		// One line, and only the shortcuts that apply here.
 		ctx.ui.setWidget?.("pi-pair", pair
-			? [[...(approve ? [approve] : []), ...(tasks ? ["/pair:tasks Tasks"] : []), ...(pairing ? ["/pair:settings Settings"] : []), "/pair:exit Exit Pair"].join(" · ")]
+			? [[...(approve ? [approve] : []), ...(tasks ? ["/pair:tasks Tasks"] : []), ...(pairing ? ["/pair:profile Profile"] : []), "/pair:exit Exit Pair"].join(" · ")]
 			: undefined);
 	}
 
@@ -158,10 +162,12 @@ export default function (pi: ExtensionAPI, factory: ClassifierFactory = classifi
 		if (spec !== name || !on) selection = undefined;
 		intent = undefined;
 		next = undefined;
+		report = undefined;
 		requested = undefined;
 		waiting = undefined;
 		pair = on;
 		spec = name;
+		profile = spec ? savedProfile(ctx) : loose;
 		pi.appendEntry(ENTRY, snapshot());
 		show(ctx);
 		syncTools();
@@ -169,22 +175,30 @@ export default function (pi: ExtensionAPI, factory: ClassifierFactory = classifi
 
 	/** Which extension, or Pi itself, provides a tool now: a name proves nothing, since any extension can take one over. */
 	const origin = (name: string) => pi.getAllTools().find((tool) => tool.name === name)?.sourceInfo;
-	/** What the model may use in ordinary Pair: Pi's own read tools, questions, and during a confirmed slice Pair's guarded edit
-	 * and write. Everything else, shell and unknown tools included, is denied. */
-	const permitted = (name: string) => name === ASK
+	/** Both drivers can inspect with Pi's read tools, bash and the named web tools; approvals belong to the permission policy.
+	 * Pair guards edit/write itself, and stale or paused requests cannot run commands or web tools. */
+	const permitted = (name: string) => name === ASK || name === PROFILE || (name === FILES && preferred().driver === "model")
 		|| (READ_TOOLS.includes(name) && origin(name)?.source === "builtin")
+		|| ((WEB_TOOLS.includes(name) || (name === "bash" && origin(name)?.source === "builtin"))
+			&& (!serving || (!stale(serving) && !serving.paused)))
 		|| (SOURCE_TOOLS.includes(name) && !!grant() && origin(name)?.path === origin(ASK)?.path);
 
 	function syncTools() {
-		const own = loadout ?? pi.getActiveTools().filter((name) => name !== SHOW_CODE && name !== ASK && name !== WRITE);
+		const active = pi.getActiveTools();
+		// Keep research tools activated by web_enable mid-session, without activating any disabled web capability ourselves.
+		const own = [...new Set([...(loadout ?? active.filter((name) => ![SHOW_CODE, ASK, PROFILE, FILES, WRITE].includes(name))),
+			...active.filter((name) => WEB_TOOLS.includes(name))])];
 		// Pair narrows while it is on, and after Stop while a request it resolved is still being served.
 		const narrowed = pair || !!serving;
 		loadout = narrowed ? own : undefined;
-		// Spec keeps its allowlist; Pair offers only what the developer had and Pair permits, so nothing disabled comes back.
-		const tools = !narrowed ? [...own] : specMode() ? [...new Set([...own.filter((name) => READ_TOOLS.includes(name)), ...READ_TOOLS])]
-			: own.filter(permitted);
+		// Pi enables only read/bash/edit/write by default; add discovery tools without changing the loadout restored on exit.
+		const tools = !narrowed ? [...own] : specMode() ? [...new Set([...own.filter((name) => READ_TOOLS.includes(name) || WEB_TOOLS.includes(name)), ...READ_TOOLS])]
+			: [...new Set([...own, ...READ_TOOLS])].filter(permitted);
 		if (showable()) tools.push(SHOW_CODE);
 		if (pair) tools.push(ASK);
+		if (pair && !specMode()) tools.push(...[PROFILE, FILES].filter(permitted));
+		// With an approved spec, either driver can hand a slice back so the task list returns; it never completes the task.
+		if (pair && !!spec && !specMode()) tools.push(REPORT);
 		if (specMode()) tools.push(WRITE);
 		pi.setActiveTools(tools);
 	}
@@ -193,7 +207,8 @@ export default function (pi: ExtensionAPI, factory: ClassifierFactory = classifi
 		if (!spec) return;
 		const name = spec;
 		const connected = await adapter;
-		if (!pair || spec !== name || !connected?.capabilities.has("open")) return;
+		if (!pair || spec !== name) return;
+		if (!connected?.capabilities.has("open")) return ctx.ui.notify(`Spec file: ${specPath()}`, "info");
 		try { await openEditor(connected.send, specPath(), connected.signal); }
 		catch (error) { ctx.ui.notify(`Could not open spec: ${(error as Error).message}`, "warning"); }
 	}
@@ -235,21 +250,13 @@ export default function (pi: ExtensionAPI, factory: ClassifierFactory = classifi
 		if (modified) throw new Error(`${what} has unsaved changes in the editor. Save them first; nothing was written.`);
 	}
 
-	/** Loaded once, on the first message that needs triage; without it, messages reach the model unchanged. */
-	async function getClassifier(ctx: ExtensionContext) {
-		if (classifier || classifierFailed) return classifier;
-		try {
-			classifier = await factory({ signal: AbortSignal.timeout(5 * 60_000) });
-		} catch (error) {
-			classifierFailed = true;
-			ctx.ui.notify(`Local triage model unavailable, so Pair sends messages to the model unchanged: ${(error as Error).message}`, "warning");
-		}
-		return classifier;
-	}
-
 	const currentContract = (ctx: ExtensionContext): Contract | undefined => {
 		if (!specMode()) return undefined;
-		try { return contractFor(loadSpec(ctx.cwd), selection, intent); } catch { return undefined; }
+		try {
+			const contract = contractFor(loadSpec(ctx.cwd), selection, intent);
+			contract.tools.push(...pi.getActiveTools().filter((name) => WEB_TOOLS.includes(name)));
+			return contract;
+		} catch { return undefined; }
 	};
 	const hidden = (ctx: ExtensionContext) => {
 		const contract = currentContract(ctx);
@@ -318,9 +325,11 @@ export default function (pi: ExtensionAPI, factory: ClassifierFactory = classifi
 		request && stale(request) ? "This request was made before Pair changed; nothing it implied is granted. Ask the developer to send it again."
 		: request?.paused ? `Changes are paused: ${request.paused}`
 		: SOURCE_TOOLS.includes(name) && grant() ? `${name} is provided by another extension here, so Pair cannot check its writes; it is not used while pairing.`
-		: SOURCE_TOOLS.includes(name) ? "The developer drives this request: suggest the change for them to make. Only a slice they confirm lets the model edit."
-		: READ_TOOLS.includes(name) ? `${name} is provided by an extension here, not by Pi, so Pair does not let the model use it while pairing.`
-		: `While pairing the model reads, asks and shows code; ${name} is not available. Suggest a command for the developer to run instead.`;
+		: (SOURCE_TOOLS.includes(name) || name === FILES) && preferred().driver === "human"
+			? "The developer drives: suggest the change for them to make, or propose the model driving with pair_profile."
+		: SOURCE_TOOLS.includes(name) ? "Propose the files with pair_files first: the model changes only files the developer confirms."
+		: READ_TOOLS.includes(name) || name === "bash" ? `${name} is provided by an extension here, not by Pi, so Pair does not let the model use it while pairing.`
+		: `${name} is not available while pairing. Use the available tools or ask the developer instead.`;
 
 	pi.registerTool({
 		name: ASK,
@@ -338,6 +347,119 @@ export default function (pi: ExtensionAPI, factory: ClassifierFactory = classifi
 		},
 	});
 
+	const said = (text: string) => ({ content: [{ type: "text" as const, text }], details: {} });
+
+	pi.registerTool({
+		name: PROFILE,
+		label: "Propose profile",
+		description: "Propose a change to the developer's Pair profile (who drives, assistance, checkpoint), with one line on why. "
+			+ "The developer's profile dialog opens with your proposal selected; only their Submit changes it, and it applies at once.",
+		parameters: profileParameters,
+		executionMode: "sequential",
+		async execute(_id, params, signal, _update, ctx) {
+			if (!pair || specMode()) throw new Error("There is no Pair profile to change here.");
+			if (!ctx.hasUI) throw new Error("No dialogs available; ask in chat instead.");
+			const { reason, ...fields } = params;
+			const current = preferred();
+			const proposed = Object.fromEntries(Object.entries(fields).filter(([key, value]) => value !== undefined && value !== current[key as keyof Profile]));
+			if (!Object.keys(proposed).length) return said(`The profile is already ${describe(current)}.`);
+			trace(ctx, "profile_proposed", { ...proposed, reason });
+			const chosen = await chooseProfile(ctx, { proposed, reason, signal });
+			return said(chosen ? `The developer set the profile: ${describe(chosen)}. It applies now.`
+				: `The developer kept the profile: ${describe(preferred())}. Carry on within it.`);
+		},
+	});
+
+	pi.registerTool({
+		name: FILES,
+		label: "Propose files",
+		description: "When the model drives: before your first edit, propose the exact files you will change, each with one line on why. "
+			+ "The developer confirms or cancels; you may change only confirmed files, until this request ends. Call it again to add files.",
+		parameters: Type.Object({
+			files: Type.Array(Type.Object({
+				path: Type.String({ minLength: 1, description: "Project-relative file path" }),
+				why: Type.String({ minLength: 1, maxLength: 200, description: "One line on what changes there" }),
+			}, { additionalProperties: false }), { minItems: 1, maxItems: 20 }),
+		}, { additionalProperties: false }),
+		executionMode: "sequential",
+		async execute(_id, params, signal, _update, ctx) {
+			if (!pair || specMode()) throw new Error("There are no files to propose here.");
+			const request = serving;
+			if (preferred().driver !== "model" || !request || stale(request) || request.paused) throw new Error(refusal(FILES, request));
+			if (!ctx.hasUI) throw new Error("No dialogs available; ask in chat which files you may change.");
+			return said(await proposeFiles(ctx, request, params.files, signal));
+		},
+	});
+
+	pi.registerTool({
+		name: REPORT,
+		label: "Report slice",
+		description: "Say the current task's slice is implemented and checked, or that you are blocked, with a short summary. "
+			+ "Code brings the developer back to the task so they can review it; it never marks the task done. Call it once, then stop.",
+		parameters: Type.Object({
+			task: Type.String({ minLength: 1, description: "The id of the task you are implementing." }),
+			status: Type.Union([Type.Literal("implemented"), Type.Literal("blocked")], { description: "implemented when the slice is done and checked; blocked when you cannot finish it." }),
+			summary: Type.String({ minLength: 1, maxLength: 1000, description: "A short note on what changed and how you checked it, or what blocked you." }),
+		}, { additionalProperties: false }),
+		executionMode: "sequential",
+		async execute(_id, params, _signal, _update, ctx) {
+			if (!pair || !spec || specMode()) throw new Error("There is no task to report on here.");
+			if (!selection) throw new Error("No task is being implemented, so there is nothing to report; ask the developer which task.");
+			if (params.task !== selection) throw new Error(`This session is implementing task ${selection}, not ${params.task}.`);
+			const current = loadSpec(ctx.cwd).view.tasks.find((item) => item.id === selection);
+			if (!current) throw new Error(`The spec has no task ${selection}.`);
+			if (current.completed) throw new Error(`Task ${selection} is already done; nothing to report.`);
+			report = { task: selection, status: params.status, summary: params.summary };
+			next = "progress";
+			trace(ctx, "reported", { task: selection, status: params.status, summary: params.summary });
+			return said(params.status === "implemented"
+				? "Noted. Stop here: don't keep editing. The developer reviews the slice and marks the task done."
+				: "Noted as blocked. Stop here and hand back to the developer.");
+		},
+	});
+
+	/** The only way the model gets files: it proposes them, code checks them as it checks every write, and the developer confirms
+	 * with one key. Each file's baseline is taken at that moment. A cancelled or late answer grants nothing. A1: until task 7, an
+	 * outside file is accepted only under a root already approved for this spec. */
+	async function proposeFiles(ctx: ExtensionContext, request: Request, files: { path: string; why: string }[], signal?: AbortSignal) {
+		const before = revision;
+		const roots = approvedRoots(ctx);
+		const project = realpathSync.native(ctx.cwd);
+		const fresh = new Map<string, { path: string; why: string }>(); // By where each really lands, so an alias is one file.
+		for (const file of files) {
+			const target = landing(ctx.cwd, file.path, roots);
+			if (!target) throw new Error(`${file.path} is outside the project, or among Pair's own files, so it cannot be proposed.`);
+			if (statSync(target, { throwIfNoEntry: false })?.isFile() === false) throw new Error(`${file.path} is not a file; propose files, not directories.`);
+			if (!request.slice?.targets.has(target) && !fresh.has(target)) fresh.set(target, file);
+		}
+		if (!fresh.size) return `Already confirmed: ${request.files!.join(", ")}.`;
+		const list = [...fresh].map(([target, { path, why }]) => `  ${path} \u2014 ${why}${within(project, target) ? "" : " (outside this project)"}`).join("\n");
+		waiting = "confirm";
+		show(ctx);
+		let choice: string | undefined;
+		try {
+			choice = await ctx.ui.select(`The model proposes to change${request.files?.length ? ", besides the files already confirmed" : ""}:\n${list}\n`
+				+ "Confirm lets it edit exactly these until it stops; Cancel lets it edit none of them.", [CONFIRM, CANCEL], { signal });
+		} finally {
+			waiting = undefined;
+			show(ctx);
+		}
+		const paths = [...fresh.values()].map(({ path }) => path);
+		if (revision !== before || serving !== request || request.paused || preferred().driver !== "model") {
+			throw new Error("Pair changed while the developer was asked, so nothing was confirmed.");
+		}
+		if (choice !== CONFIRM) {
+			trace(ctx, "files_cancelled", { request: request.id, files: paths });
+			return `The developer cancelled: change none of ${paths.join(", ")}. Ask in chat what they want instead.`;
+		}
+		request.slice = openSlice(ctx.cwd, paths, roots, request.slice);
+		request.files = [...(request.files ?? []), ...paths];
+		trace(ctx, "files_confirmed", { request: request.id, files: paths });
+		show(ctx);
+		syncTools();
+		return `Confirmed: ${paths.join(", ")}. Change only ${request.files.join(", ")}, with edit for files that exist and write only for new ones.`;
+	}
+
 	pi.registerTool({
 		name: WRITE,
 		label: "Write spec",
@@ -348,7 +470,8 @@ export default function (pi: ExtensionAPI, factory: ClassifierFactory = classifi
 		async execute(_id, params, signal, _update, ctx) {
 			if (!pair || !spec) throw new Error("An active spec is required.");
 			const contract = currentContract(ctx);
-			if (!contract || !allowsWrite(contract, params as Record<string, unknown>)) throw new Error(`Outside this turn's scope: it may write ${scopeText(contract)}.`);
+			if (!contract) throw new Error(`Outside this turn's scope: it may write ${scopeText(contract)}.`);
+			if (!allowsWrite(contract, params as Record<string, unknown>)) await allowWider(ctx, contract, params, signal);
 			signal?.throwIfAborted();
 			const file = specFile(ctx.cwd)!;
 			let summary = "";
@@ -382,6 +505,18 @@ export default function (pi: ExtensionAPI, factory: ClassifierFactory = classifi
 			return { content: [{ type: "text" as const, text: `Saved ${summary}.` }], details: { summary } };
 		},
 	});
+
+	/** Q2: a write outside the turn's scope asks the developer first, one key, one write. Declined, cancelled or late, it is refused. */
+	async function allowWider(ctx: ExtensionContext, contract: Contract, params: { kind: string; id?: string; names?: string[] }, signal?: AbortSignal) {
+		const before = revision;
+		const name = params.id ? findTask(loadSpec(ctx.cwd).parsed, params.id)?.name : undefined;
+		const what = params.kind === "task" ? `task ${params.id}${name ? `: ${name}` : ""}`
+			: `the goal, order or task list${params.names?.length ? `, adding ${params.names.join(", ")}` : ""}`;
+		const choice = ctx.hasUI ? await ctx.ui.select(`The model wants to write ${what}. This turn may write ${scopeText(contract)}.`, [ALLOW_WRITE, CANCEL], { signal }) : undefined;
+		if (choice === ALLOW_WRITE && revision === before) return trace(ctx, "write_allowed", { scope: contract.write, params });
+		trace(ctx, "write_declined", { scope: contract.write, params });
+		throw new Error(`The developer did not allow writing ${what}; this turn may write ${scopeText(contract)}. Ask in chat instead.`);
+	}
 
 	const scopeText = (contract?: Contract) =>
 		!contract ? "nothing" : contract.write === "task" ? `task ${contract.task} only` : contract.write === "tasks" ? "the goal, the order and new tasks" : "any task";
@@ -465,7 +600,7 @@ export default function (pi: ExtensionAPI, factory: ClassifierFactory = classifi
 		const text = (await ctx.ui.input("Describe changes", "What to change; it may span several tasks"))?.trim();
 		if (revision !== before || selection !== id) return;
 		if (!text) return id ? taskMenu(ctx) : showTasks(ctx);
-		intent = { scope: id ? "task" : "any", operation: "edit" };
+		intent = { scope: id ? "task" : "any" };
 		next = id ? "task" : "tasks";
 		requested = text;
 		trace(ctx, "requested", { text });
@@ -477,9 +612,6 @@ export default function (pi: ExtensionAPI, factory: ClassifierFactory = classifi
 		if (!pair || !spec) throw new Error("Pick a spec with /pair first.");
 		const before = revision;
 		intent = undefined;
-		// The list is the hub, so the spec itself is in view whenever it is open.
-		await openSpec(ctx);
-		if (revision !== before) return;
 		const { parsed, view } = loadSpec(ctx.cwd);
 		// Once the spec is approved the list is the plan as progress, and reads apart from this one.
 		if (view.ready) return showProgress(ctx, before);
@@ -492,9 +624,10 @@ export default function (pi: ExtensionAPI, factory: ClassifierFactory = classifi
 			if (revision !== before || choice === undefined) return;
 			if (choice === APPROVE_SPEC) return approve(ctx);
 		}
-		const options = view.tasks.map((task) => `${task.name} · ${label(task)}`);
-		const choice = await ctx.ui.select(`Spec tasks · ${spec}`, [...options, NEW_TASK, DESCRIBE, ...(view.approvable ? [APPROVE_SPEC] : []), CANCEL]);
+		const options = view.tasks.map((task) => `${task.id}. ${task.name} · ${label(task)}`);
+		const choice = await ctx.ui.select(`Spec tasks · ${spec}`, [...options, NEW_TASK, DESCRIBE, ...(view.approvable ? [APPROVE_SPEC] : []), CANCEL, SHOW_SPEC]);
 		if (revision !== before || choice === undefined || choice === CANCEL) return;
+		if (choice === SHOW_SPEC) return openSpec(ctx);
 		if (choice === APPROVE_SPEC) return approve(ctx);
 		if (choice === DESCRIBE) return describeChanges(ctx);
 		if (choice === NEW_TASK) {
@@ -509,37 +642,31 @@ export default function (pi: ExtensionAPI, factory: ClassifierFactory = classifi
 	/** The task to do next: the one being implemented, or else the first not yet done. */
 	const nextTask = (view: Status) => view.tasks.find((item) => item.id === selection && !item.completed) ?? view.tasks.find((item) => !item.completed);
 
-	/** Code asks, never the model: a preset, or each setting on its own. Cancelling or a stale reply keeps what was there. */
-	async function chooseSettings(ctx: ExtensionContext): Promise<void> {
+	/** The one profile dialog, for the first choice, /pair:profile and the model's pair_profile proposals. Only Submit changes it:
+	 * the latest choice is saved with the spec, or kept in memory without one. Cancelling, or a reply after Pair changed, keeps what
+	 * was there. Submitted mid-turn, it applies to the rest of the turn: the tools now, and the contract on the next model call. */
+	async function chooseProfile(ctx: ExtensionContext, proposal: { proposed?: Partial<Profile>; reason?: string; signal?: AbortSignal } = {}) {
 		const before = revision;
 		const current = preferred();
-		const presets = Object.entries(PRESETS).map(([name, value]) => `${name} · ${describe(value)}`);
-		const choice = await ctx.ui.select(`Pair settings · now ${presetOf(current) ?? "custom"}${settings ? "" : " (default)"}: ${describe(current)}`,
-			[...presets, ADJUST_SETTINGS, CANCEL]);
-		if (revision !== before) return;
-		const chosen = choice === ADJUST_SETTINGS ? await adjustSettings(ctx, before) : Object.values(PRESETS)[presets.indexOf(choice!)];
-		if (!chosen || revision !== before) return;
-		settings = chosen;
-		revision++; // Ends any live slice: a new arrangement needs its own confirmation.
-		pi.appendEntry(ENTRY, snapshot());
-		trace(ctx, "settings", { ...settings });
-		announce(`Pair settings: ${presetOf(settings) ?? "custom"}, ${describe(settings)}.`
-			+ (settings.driver === "model" ? " The model edits only a slice you confirm, then hands back to you." : ""));
+		const chosen = profileFrom(current, await askDeveloper(ctx, profileQuestions(current, proposal.proposed, proposal.reason), proposal.signal));
+		if (!chosen || revision !== before) return undefined;
+		const file = specFile(ctx.cwd);
+		if (file) await withFileMutationQueue(file, async () => {
+			await requireSaved(ctx, [stateFile(specPath())], "The spec's state");
+			if (revision === before) writeState(stateFile(file), { ...loadFile(file).state, profile: chosen });
+		});
+		if (revision !== before) return undefined;
+		if (!file) loose = chosen;
+		profile = chosen;
+		// Taking the keyboard back is immediate: no grant outlives it. Other changes leave the request it is working on alone.
+		if (chosen.driver === "human") for (const request of [serving, ...pending]) {
+			if (request?.files?.length && !request.paused) request.paused = "The developer is driving now.";
+		}
+		trace(ctx, "profile", { ...chosen });
+		announce(`Pair profile: ${describe(chosen)}.` + (chosen.driver === "model" ? " The model edits only files you confirm." : ""));
 		show(ctx);
-	}
-
-	/** Each setting on its own, so help can change without the driver. */
-	async function adjustSettings(ctx: ExtensionContext, before: number): Promise<Settings | undefined> {
-		const pick = async <T extends string>(title: string, labels: Record<T, string>) => {
-			const choice = await ctx.ui.select(title, Object.values(labels));
-			return revision === before ? (Object.keys(labels) as T[]).find((key) => labels[key] === choice) : undefined;
-		};
-		const driver = await pick("Who drives by default?", DRIVERS);
-		if (!driver) return;
-		const assistance = await pick("How much help?", HELP);
-		if (!assistance) return;
-		const checkpoint = await pick("When does Pair check in?", CHECKPOINTS);
-		return checkpoint && { driver, assistance, checkpoint };
+		syncTools();
+		return chosen;
 	}
 
 	/** The external project roots the developer approved for the current spec; empty without a spec. */
@@ -547,175 +674,16 @@ export default function (pi: ExtensionAPI, factory: ClassifierFactory = classifi
 		const file = specFile(ctx.cwd);
 		try { return file ? (loadFile(file).state.externalRoots ?? []) : []; } catch { return []; }
 	}
-	/** Persist one approved external root with the spec. External access needs a spec: its rules live with it, not the project. */
-	function approveRoot(ctx: ExtensionContext, root: string) {
-		const file = specFile(ctx.cwd); if (!file) return;
-		const state = structuredClone(loadFile(file).state);
-		const roots = state.externalRoots ?? (state.externalRoots = []);
-		if (!roots.includes(root)) { roots.push(root); writeState(stateFile(file), state); trace(ctx, "external", { root }); }
-	}
-	function muteExternal(ctx: ExtensionContext) {
-		const file = specFile(ctx.cwd); if (!file) return;
-		const state = structuredClone(loadFile(file).state);
-		state.externalMuted = true; writeState(stateFile(file), state);
-	}
-	function isExternalMuted(ctx: ExtensionContext): boolean {
-		const file = specFile(ctx.cwd);
-		try { return file ? (loadFile(file).state.externalMuted ?? false) : false; } catch { return false; }
-	}
-	/** The files the developer last picked for this spec, so the browser opens with them already checked. Not a grant. */
-	function savedTargets(ctx: ExtensionContext): string[] {
-		const file = specFile(ctx.cwd);
-		try { return file ? (loadFile(file).state.targets ?? []) : []; } catch { return []; }
-	}
-	function saveTargets(ctx: ExtensionContext, targets: string[]) {
-		const file = specFile(ctx.cwd); if (!file) return;
-		const state = structuredClone(loadFile(file).state);
-		state.targets = targets; writeState(stateFile(file), state);
-	}
-	/** The root of the project a file belongs to: its nearest ancestor with a .git, else the directory it sits in. */
-	function projectRootOf(dir: string): string {
-		for (let at = dir; ;) {
-			if (existsSync(join(at, ".git"))) return realpathSync.native(at);
-			const parent = dirname(at);
-			if (parent === at) return realpathSync.native(dir);
-			at = parent;
-		}
-	}
-	/** The developer-approved override: expand Pair's core security for this spec. */
-	async function expandSecurity(ctx: ExtensionContext): Promise<"yes" | "no" | "mute"> {
-		const choice = await ctx.ui.select(
-			"Expand Pair's core security for this spec?\n"
-			+ "By default Pair may only touch files inside this project. Approving lets you add files and folders from outside it — "
-			+ "a sibling repo, for example — as targets the model may edit. This approval is recorded with this spec only, and you still "
-			+ "confirm every slice.",
-			[PICK_EXTERNAL, CANCEL, DONT_ASK]);
-		return choice === PICK_EXTERNAL ? "yes" : choice === DONT_ASK ? "mute" : "no";
-	}
-
-	/** Pick files by walking the filesystem with ordinary select dialogs, so paths are not typed by hand. Stored names are
-	 * project-relative (external ones read like ../sibling/file). SPC ticks a file or a whole directory's direct files; →
-	 * or Enter descends into a directory, ← goes up (freely, since browsing is read-only), and C-c C-c is the one way to save and move on.
-	 * The spec remembers the last selection, so the browser opens with those files already ticked. Selecting anything outside
-	 * the project needs the developer's per-spec approval, which records its project root (git root, else its folder) for the gate.
-	 * Returns the saved files, undefined if Pair changed underneath. Cancelling keeps CHOSEN unchanged.
-	 * ponytail: one directory at a time, and each render stats the subdirectories to show their [x]; fine for v1. */
-	async function browseFiles(ctx: ExtensionContext, before: number, chosen: string[], start?: string): Promise<string[] | undefined> {
-		const DESCEND = 0x1d; // The editor marks → with a leading U+001D; plain Enter on a directory (its raw label) also descends.
-		const TOGGLE = 0x1e; // The editor marks SPC (tick/untick) with a leading U+001E, so it never navigates.
-		const SAVE = "\x06"; // C-c C-c: the one way to save the selection and move on. Any other finish is a cancel.
-		const project = realpathSync.native(ctx.cwd);
-		const selected = new Set([...savedTargets(ctx), ...chosen]); // Pre-checked from what the spec remembers.
-		const name = (abs: string) => relative(project, abs); // Project-relative; external paths read as ../sibling/file.
-		const filesIn = (dir: string) => { try { return readdirSync(dir, { withFileTypes: true }).filter((e) => e.isFile()).map((e) => join(dir, e.name)); } catch { return []; } };
-		// May an about-to-be-selected path become a target? Inside the project, yes; outside, only with the per-spec override.
-		const allow = async (abs: string): Promise<boolean> => {
-			if (within(project, abs) || approvedRoots(ctx).some((r) => within(r, abs))) return true;
-			if (!spec) { ctx.ui.notify("Selecting files outside the project needs a spec; the rules live with it.", "warning"); return false; }
-			if (isExternalMuted(ctx)) return false;
-			const answer = await expandSecurity(ctx);
-			if (answer === "mute") { muteExternal(ctx); return false; }
-			if (answer !== "yes") return false;
-			approveRoot(ctx, projectRootOf(dirname(abs)));
-			return true;
-		};
-		let here = project;
-		if (start) { try { here = realpathSync.native(start); } catch { /* fall back to the project root */ } }
-		for (;;) {
-			let entries: import("node:fs").Dirent[];
-			try { entries = readdirSync(here, { withFileTypes: true }); }
-			catch { ctx.ui.notify(`Cannot read ${name(here) || "."}.`, "warning"); if (here === project) return chosen; here = dirname(here); continue; }
-			const atProject = here === project;
-			// Pair's own files and .git are never slice targets, so there is no reason to walk into them.
-			const dirs = entries.filter((e) => e.isDirectory() && e.name !== ".git" && !(atProject && e.name === ".pi")).map((e) => e.name).sort();
-			const files = entries.filter((e) => e.isFile()).map((e) => e.name).sort();
-			const picked = (abs: string) => selected.has(name(abs));
-			const fullDir = (abs: string) => { const fs = filesIn(abs); return fs.length > 0 && fs.every(picked); };
-			const box = (on: boolean) => (on ? "[x] " : "[ ] ");
-			const allSelected = files.length > 0 && files.every((n) => picked(join(here, n)));
-			const toggleFile = async (n: string) => { const abs = join(here, n), p = name(abs); if (selected.has(p)) selected.delete(p); else if (await allow(abs)) selected.add(p); };
-			const toggleAll = async () => { if (allSelected) files.forEach((n) => selected.delete(name(join(here, n)))); else if (files.length && await allow(join(here, files[0]))) files.forEach((n) => selected.add(name(join(here, n)))); };
-			// Tick a whole directory: its direct files only. ponytail: not recursive; descend to add subfolders.
-			const toggleDir = async (n: string) => { const sub = filesIn(join(here, n)); if (!sub.length) { here = join(here, n); return; } if (sub.every(picked)) sub.forEach((abs) => selected.delete(name(abs))); else if (await allow(sub[0])) sub.forEach((abs) => selected.add(name(abs))); };
-			const items = [
-				{ label: "↑..", kind: "up" as const },
-				...(files.length ? [{ label: `${box(allSelected)}all`, kind: "all" as const }] : []),
-				...dirs.map((n) => ({ label: `${box(fullDir(join(here, n)))}${n}/`, kind: "dir" as const, name: n })),
-				...files.map((n) => ({ label: `${box(picked(join(here, n)))}${n}`, kind: "file" as const, name: n })),
-				{ label: "Type a path…", kind: "type" as const },
-			];
-			const where = name(here) || "project root";
-			const choice = await ctx.ui.select(`Choose files · ${where}${selected.size ? ` · ${selected.size} selected` : ""}\n`
-				+ "SPC ticks · →/Enter into folder · ← up · C-c C-c saves", items.map((i) => i.label));
-			if (revision !== before) return undefined;
-			if (choice === undefined) return chosen; // Cancel (Esc/q) discards edits and keeps what was already confirmed.
-			if (choice === SAVE) { // C-c C-c: the only save. Validate, remember on the spec, and move on.
-				try { openSlice(ctx.cwd, [...selected], approvedRoots(ctx)); saveTargets(ctx, [...selected]); return [...selected]; }
-				catch (error) { ctx.ui.notify((error as Error).message, "warning"); continue; }
-			}
-			const mark = choice.charCodeAt(0);
-			const descend = mark === DESCEND; // → or Enter on a directory: navigate in.
-			const toggle = mark === TOGGLE; // SPC: tick/untick, never navigate.
-			const item = items.find((i) => i.label === (descend || toggle ? choice.slice(1) : choice));
-			if (!item) continue; // Not one of ours: show the list again.
-			if (toggle) { // SPC selects without ever entering a directory.
-				if (item.kind === "file") await toggleFile(item.name!);
-				else if (item.kind === "dir") { if (filesIn(join(here, item.name!)).length) await toggleDir(item.name!); }
-				else if (item.kind === "all") await toggleAll();
-			}
-			else if (descend) { if (item.kind === "dir") here = join(here, item.name!); }
-			else if (item.kind === "up") { const parent = dirname(here); if (parent !== here) here = parent; } // Browsing up is free; the gate still guards selection.
-			else if (item.kind === "dir") here = join(here, item.name!); // Enter navigates into the folder.
-			else if (item.kind === "all") await toggleAll();
-			else if (item.kind === "file") await toggleFile(item.name!);
-			else if (item.kind === "type") {
-				const text = await ctx.ui.input("Type a path", "Project-relative, separated by commas or spaces");
-				if (revision !== before) return undefined;
-				// Validate each typed path now, so a bad one is refused here instead of silently blocking Confirm later.
-				if (text) try { const add = parseTargets(text); openSlice(ctx.cwd, add, approvedRoots(ctx)); add.forEach((f) => selected.add(f)); } catch (error) { ctx.ui.notify((error as Error).message, "warning"); }
-			}
-			if (revision !== before) return undefined; // A confirm dialog may have been awaited above.
-		}
-	}
-
-	/** A model slice starts only here: the arrangement, what it is for and the exact files, confirmed by the developer.
-	 * Files proposed or adjusted are never a grant on their own; only Confirm with a valid list is. */
-	async function confirmHandoff(ctx: ExtensionContext, title: string, behaviour: string): Promise<string[] | undefined> {
-		const before = revision;
-		let targets: string[] = savedTargets(ctx); // The spec remembers the last selection; the developer still confirms it.
-		waiting = "confirm";
-		show(ctx);
-		try {
-			for (;;) {
-				const { assistance, checkpoint } = preferred();
-				const choice = await ctx.ui.select(`${title}\n`
-					+ `Driver: the model for this slice, then you again at review · Help: ${assistance} · Check-in: ${CHECKPOINTS[checkpoint].toLowerCase()}\n`
-					+ `Behaviour: ${behaviour}\nFiles: ${targets.join(", ") || "none yet; Choose files to pick them"}`, [CONFIRM, CHOOSE_FILES, CANCEL]);
-				if (revision !== before || (choice !== CONFIRM && choice !== CHOOSE_FILES)) return undefined;
-				if (choice === CONFIRM && targets.length) {
-					trace(ctx, "handoff", { title, targets });
-					return targets;
-				}
-				if (choice === CONFIRM) { ctx.ui.notify("Choose the files the model may change before confirming.", "warning"); continue; }
-				const picked = await browseFiles(ctx, before, targets);
-				if (revision !== before || picked === undefined) return undefined;
-				targets = picked;
-			}
-		} finally {
-			waiting = undefined;
-			show(ctx);
-		}
-	}
-
 	/** The pairing-mode list: the plan as progress. A task is implemented, marked done or reset from here. */
 	async function showProgress(ctx: ExtensionContext, before: number): Promise<void> {
 		pi.appendEntry(ENTRY, snapshot());
 		show(ctx);
-		const { parsed, view } = loadSpec(ctx.cwd);
+		const { view } = loadSpec(ctx.cwd);
 		const current = nextTask(view);
-		const rows = view.tasks.map((task) => `${task.name}${task.completed ? " · done" : task.id === current?.id ? " · next" : ""}`);
-		const choice = await ctx.ui.select(`Pair tasks · ${spec}`, [...rows, CANCEL]);
+		const rows = view.tasks.map((task) => `${task.id}. ${task.name}${task.completed ? " · done" : task.id === current?.id ? " · next" : ""}`);
+		const choice = await ctx.ui.select(`Pair tasks · ${spec}`, [...rows, CANCEL, SHOW_SPEC]);
 		if (revision !== before || choice === undefined || choice === CANCEL) return;
+		if (choice === SHOW_SPEC) return openSpec(ctx);
 		const task = view.tasks[rows.indexOf(choice)];
 		if (!task) return;
 		if (task.completed) {
@@ -725,36 +693,38 @@ export default function (pi: ExtensionAPI, factory: ClassifierFactory = classifi
 			if (action === RESET_TASK) await resetTask(ctx, task.id);
 			return showTasks(ctx);
 		}
-		const action = await ctx.ui.select(`Task ${task.id}: ${task.name}`, [IMPLEMENT, IMPLEMENT_PROMPT, MARK_DONE, CANCEL]);
+		return taskAction(ctx, task, before);
+	}
+
+	/** A not-done task's actions. The order puts the likely next step first: the developer reviewing a model's report sees Mark done
+	 * or, for a blocked slice, Implement + prompt first. Choosing the task picks the work; the profile says who drives. */
+	async function taskAction(ctx: ExtensionContext, task: TaskStatus, before: number, order = [IMPLEMENT, IMPLEMENT_PROMPT, MARK_DONE, CANCEL]) {
+		const action = await ctx.ui.select(`Task ${task.id}: ${task.name}`, order);
 		if (revision !== before || action === undefined || action === CANCEL) return;
 		if (action === MARK_DONE) { await markDone(ctx, task.id); return showTasks(ctx); }
 		const extra = action === IMPLEMENT_PROMPT ? (await ctx.ui.input(`Task ${task.id}: ${task.name}`, "Anything to add before the model starts"))?.trim() : "";
 		if (revision !== before || extra === undefined) return;
-		// Choosing the task picks the work, not the driver: it goes through the same resolver as a typed request.
-		const request = await resolveRequest(ctx, "", extra, { ...task, summary: summaryOf(findTask(parsed, task.id)!) });
-		if (request && revision === before) implement(ctx, task, extra, request);
+		implement(ctx, task, extra);
 	}
 
-	/** The one resolver for ordinary Pair: a typed message, or a task started from the list with the developer's added words.
-	 * The classifier only proposes; a model slice needs the developer's confirmation; it is stamped with the revision before any
-	 * wait, so a Stop, settings, task or session change meanwhile leaves it stale. Undefined: a task start the developer declined. */
-	async function resolveRequest(ctx: ExtensionContext, text: string, words: string, task?: { id: string; name: string; summary: string }): Promise<Request | undefined> {
-		const generation = revision;
-		const about = task ? `${task.id}: ${task.name}` : taskInHand(ctx);
-		const model = words ? await getClassifier(ctx) : undefined;
-		const proposal = !words ? TASK_START : model ? await propose(model, words, `Task: ${about ?? "none"}. Now: ${describe(preferred())}.`) : UNCLEAR;
-		const plan = arrange(settings, proposal);
-		trace(ctx, "resolved", { words, ...proposal, offered: plan.offerSlice });
-		let files: string[] | undefined;
-		if (plan.offerSlice && revision === generation) {
-			files = await confirmHandoff(ctx, task ? `Hand task ${task.id}: ${task.name} to the model?` : "Hand this request to the model?",
-				task ? [task.summary, words].filter(Boolean).join("\n\n") : text);
-			// Declining a task start sends nothing; declining a typed request leaves the developer driving it.
-			if (!files && task) return undefined;
-		}
-		return { id: ++requests, generation, text, kind: plan.kind, assistance: plan.assistance, checkpoint: plan.checkpoint,
-			defaults: settings, task: about, files };
+	/** The model reported a slice: announce its summary and open the task's actions, with the likely next step first
+	 * (Mark done for an implemented slice, Implement + prompt for a blocked one). The developer still owns completion. */
+	async function returnToTask(ctx: ExtensionContext, done: Report): Promise<void> {
+		const before = revision;
+		pi.appendEntry(ENTRY, snapshot());
+		const task = loadSpec(ctx.cwd).view.tasks.find((item) => item.id === done.task);
+		if (!task || task.completed) return;
+		announce(`The model reports task ${task.id}: ${task.name} ${done.status}: ${done.summary}`);
+		show(ctx);
+		const order = done.status === "blocked"
+			? [IMPLEMENT_PROMPT, IMPLEMENT, MARK_DONE, CANCEL]
+			: [MARK_DONE, IMPLEMENT, IMPLEMENT_PROMPT, CANCEL];
+		return taskAction(ctx, task, before, order);
 	}
+
+	/** A request as it arrives: the developer's words and the task in hand, stamped with the revision so a later Stop, task or
+	 * session change leaves it stale. It grants nothing; files come only from pair_files. */
+	const newRequest = (text: string, task?: string): Request => ({ id: ++requests, generation: revision, text, task });
 
 	/** The approved spec's task being worked on, as compact context; none without an approved spec. */
 	function taskInHand(ctx: ExtensionContext) {
@@ -766,16 +736,12 @@ export default function (pi: ExtensionAPI, factory: ClassifierFactory = classifi
 	const implementation = (task: { id: string; name: string }, how = "Pair on") =>
 		`${how} task ${task.id}: ${task.name} from ${specPath()}. Read the task first: the spec is the plan, and its discussion is already settled there.`;
 
-	function implement(ctx: ExtensionContext, task: { id: string; name: string }, extra: string, request: Request) {
+	function implement(ctx: ExtensionContext, task: { id: string; name: string }, extra: string) {
 		selection = task.id;
-		revision++; // A new task start: whatever was resolved before it is stale.
-		request.generation = revision;
+		revision++; // A new task start: whatever arrived before it is stale.
 		pi.appendEntry(ENTRY, snapshot());
+		const request = newRequest(`${implementation(task)}${extra ? `\n\n${extra}` : ""}`, `${task.id}: ${task.name}`);
 		trace(ctx, "implementing", { task: task.id, request: request.id, ...(extra ? { prompt: extra } : {}) });
-		const files = request.files ?? [];
-		const slice = files.length
-			? `\n\nConfirmed slice: change only ${files.join(", ")}. Stop when this slice is done; the developer reviews it and drives again.` : "";
-		request.text = `${implementation(task, files.length ? "Implement" : "Pair on")}${extra ? `\n\n${extra}` : ""}${slice}`;
 		pending.push(request);
 		show(ctx);
 		say(request.text, true, { task: task.id, request: request.id });
@@ -852,7 +818,6 @@ export default function (pi: ExtensionAPI, factory: ClassifierFactory = classifi
 		pi.appendEntry(ENTRY, snapshot());
 		trace(ctx, "task_selected");
 		show(ctx);
-		await openSpec(ctx);
 		if (selection !== id) return;
 		const task = loadSpec(ctx.cwd).view.tasks.find((item) => item.id === id);
 		if (!task) return;
@@ -893,7 +858,7 @@ export default function (pi: ExtensionAPI, factory: ClassifierFactory = classifi
 		// The spec is approved, so the spec machinery stands down and Pair works on it, once it knows how to pair.
 		show(ctx);
 		syncTools();
-		if (!settings) await chooseSettings(ctx);
+		if (!profile) await chooseProfile(ctx);
 	}
 
 	pi.registerCommand("pair:approve", {
@@ -904,12 +869,12 @@ export default function (pi: ExtensionAPI, factory: ClassifierFactory = classifi
 		},
 	});
 
-	pi.registerCommand("pair:settings", {
-		description: "Choose who drives, how much help and when Pair checks in",
+	pi.registerCommand("pair:profile", {
+		description: "Choose who drives, how much assistance and when to check in",
 		handler: async (_args, ctx) => {
 			if (!pair) return ctx.ui.notify("Pair is off; /pair turns it on.", "warning");
 			await ctx.waitForIdle();
-			await chooseSettings(ctx);
+			try { await chooseProfile(ctx); } catch (error) { ctx.ui.notify((error as Error).message, "error"); }
 		},
 	});
 
@@ -967,12 +932,13 @@ export default function (pi: ExtensionAPI, factory: ClassifierFactory = classifi
 		const id = slug(name);
 		if (!id) throw new Error(`"${name}" has no letters or digits to name a spec file.`);
 		const file = join(cwd, SPECS, `${id}.md`);
-		if (!existsSync(file)) {
+		const created = !existsSync(file);
+		if (created) {
 			mkdirSync(join(cwd, SPECS), { recursive: true });
 			writeFileSync(file, template(name.replace(/\s+/g, " ")), { flag: "wx" });
 			if (!existsSync(stateFile(file))) writeState(stateFile(file), emptyState());
 		}
-		return id;
+		return { id, created };
 	}
 
 	/** The hard way out: whatever Pair is doing is cancelled, and Pi is ordinary again. */
@@ -1001,14 +967,18 @@ export default function (pi: ExtensionAPI, factory: ClassifierFactory = classifi
 				if (picked === undefined || before !== revision) return;
 				if (picked.name === null) {
 					setPair(true, undefined, ctx);
-					if (!settings) await chooseSettings(ctx);
+					if (!profile) await chooseProfile(ctx);
 					return;
 				}
-				const id = ensureSpec(ctx.cwd, picked.name);
+				const { id, created } = ensureSpec(ctx.cwd, picked.name);
 				loadSpec(ctx.cwd, id); // Validate before activating.
 				setPair(true, id, ctx);
+				if (created) {
+					const activated = revision;
+					await openSpec(ctx);
+					if (activated !== revision) return;
+				}
 				const { parsed, view } = loadSpec(ctx.cwd);
-				// A spec with nothing in it yet opens once the model has written it, not empty.
 				if (!parsed.tasks.length) return announce(OPENING);
 				if (picked.edit && view.ready) {
 					await reopenSpec(ctx);
@@ -1017,7 +987,7 @@ export default function (pi: ExtensionAPI, factory: ClassifierFactory = classifi
 					announce(`${id} is open for editing; approve it again once it is right.`);
 					return showTasks(ctx, false);
 				}
-				if (view.ready && !settings) await chooseSettings(ctx);
+				if (view.ready && !profile) await chooseProfile(ctx);
 				await showTasks(ctx);
 			} catch (error) { ctx.ui.notify((error as Error).message, "error"); }
 		},
@@ -1026,13 +996,13 @@ export default function (pi: ExtensionAPI, factory: ClassifierFactory = classifi
 	function restore(ctx: ExtensionContext) {
 		revision++;
 		next = undefined;
+		report = undefined;
 		requested = undefined;
 		intent = undefined;
 		waiting = undefined;
-		// Only the active branch counts, and only preferences come back: a slice's grant never outlives its turn.
+		// Only the active branch counts, and a slice's grant never outlives its turn. Old session settings are ignored: the spec holds the profile.
 		const entry = ctx.sessionManager.getBranch().findLast((entry) => entry.type === "custom" && entry.customType === ENTRY) as
-			{ data?: { pair?: boolean; spec?: string; selection?: string; settings?: unknown } } | undefined;
-		settings = readSettings(entry?.data?.settings);
+			{ data?: { pair?: boolean; spec?: string; selection?: string } } | undefined;
 		const name = entry?.data?.spec;
 		spec = typeof name === "string" && name && slug(name) === name ? name : undefined;
 		pair = entry?.data?.pair === true && (name === undefined || spec !== undefined);
@@ -1040,12 +1010,14 @@ export default function (pi: ExtensionAPI, factory: ClassifierFactory = classifi
 		try {
 			if (pair && spec && !loadSpec(ctx.cwd).parsed.tasks.some((task) => task.id === selection)) selection = undefined;
 		} catch (error) { pair = false; ctx.ui.notify(`Pair not resumed: ${(error as Error).message}`, "error"); }
+		profile = spec ? savedProfile(ctx) : loose;
 		show(ctx);
 		syncTools();
 	}
 
 	pi.on("session_start", (_event, ctx) => {
 		resetAdapter();
+		loose = undefined;
 		restore(ctx);
 		if (ctx.mode !== "rpc" || !process.env.PI_PAIR_EDITOR?.trim()) return;
 		const send = rpcTransport(ctx);
@@ -1068,7 +1040,7 @@ export default function (pi: ExtensionAPI, factory: ClassifierFactory = classifi
 	pi.on("session_tree", (_event, ctx) => restore(ctx));
 
 	pi.on("agent_settled", async (_event, ctx) => {
-		// The review boundary: a model slice ends with its turn, and the developer drives again.
+		// The review boundary: confirmed files end with the turn, and the developer reviews what changed.
 		// Paused or stale, a slice that started still has an effect to review: the confirmed files that differ from their baseline.
 		const ended = serving?.slice ? serving : undefined;
 		serving = undefined;
@@ -1083,17 +1055,27 @@ export default function (pi: ExtensionAPI, factory: ClassifierFactory = classifi
 				const where = files.map((file) => file.after === "" ? `${file.path} (emptied)`
 					: `${file.path} ${file.before === null ? "(new) " : ""}lines ${file.span!.start_line}-${file.span!.end_line}`);
 				const since = files.filter((file) => file.changedSince).map((file) => file.path);
-				say(`The model's slice${ended.task ? ` of task ${ended.task}` : ""} is finished, and you are driving again. `
+				say(`The model's slice${ended.task ? ` of task ${ended.task}` : ""} is finished, and its files are closed. `
 					+ (files.length ? `Changed: ${where.join(", ")}; each span encloses every change in its file and may include unchanged lines.` : "No files changed.")
 					+ (since.length ? ` ${since.join(", ")} changed again after the model's last write; that later change is not the model's.` : "")
 					+ (partial ? " The slice was interrupted, so its changes may be partial." : "")
-					+ " Pair ran no checks. Review it; another slice needs a new confirmation.",
+					+ " Review the changes and any check results above; further changes need files confirmed again.",
 					false, { review: { request: ended.id, task: ended.task ?? null, partial, files } });
 				show(ctx);
 			}
 		}
 		const todo = next;
+		const reported = report;
 		next = undefined;
+		report = undefined;
+		// The model reported a slice: with an approved spec still live and that task still selected, return to it for review.
+		if (todo === "progress") {
+			if (!pair || !spec || specMode() || !reported || selection !== reported.task) return;
+			trace(ctx, "settled", { todo });
+			try { await returnToTask(ctx, reported); }
+			catch (error) { ctx.ui.notify((error as Error).message, "error"); }
+			return;
+		}
 		if (!specMode()) return;
 		trace(ctx, "settled", { todo: todo ?? "nothing" });
 		if (!todo) return;
@@ -1101,52 +1083,29 @@ export default function (pi: ExtensionAPI, factory: ClassifierFactory = classifi
 		catch (error) { ctx.ui.notify((error as Error).message, "error"); }
 	});
 
-	pi.on("input", async (event, ctx) => {
+	pi.on("input", (event, ctx) => {
 		if (pair && !specMode()) {
-			// New words may withdraw what is running, so a live slice pauses before anything is awaited.
+			// D1: new words may withdraw what is running, so a live slice ends here; the model proposes its files again if it still needs them.
 			const live = grant();
 			if (live) {
-				live.paused = "The developer sent another message; the slice waits for it.";
+				live.paused = "The developer sent another message; wait for it.";
 				trace(ctx, "slice_suspended", { request: live.id });
 				show(ctx);
 				syncTools();
 			}
-			const generation = revision;
-			try {
-				const request = await resolveRequest(ctx, event.text, event.text);
-				if (request) pending.push(request);
-			} catch (error) {
-				// The message still goes, with the developer's words intact, but changes wait.
-				ctx.ui.notify(`Pair could not resolve this request, so changes are paused: ${(error as Error).message}`, "warning");
-				const plan = arrange(settings, UNCLEAR);
-				pending.push({ id: ++requests, generation, text: event.text, kind: plan.kind, assistance: plan.assistance, checkpoint: plan.checkpoint,
-					defaults: settings, paused: "Pair could not resolve this request." });
-			}
+			pending.push(newRequest(event.text, taskInHand(ctx)));
 			return;
 		}
 		if (!specMode()) return;
-		const before = revision;
-		try {
-			trace(ctx, "input", { text: event.text, source: event.source });
-			if (event.text === requested) { requested = undefined; return; }
-			intent = undefined;
-			// Everything up to the first task list is linear: the contract follows the step, not the words.
-			if (!loadSpec(ctx.cwd).parsed.tasks.length) return;
-			const model = await getClassifier(ctx);
-			if (revision !== before) return { action: "handled" };
-			if (!model) return;
-			const result = await triage(model, event.text, { task: selection });
-			if (revision !== before) return { action: "handled" };
-			trace(ctx, "triage", { ...result });
-			if (result.scope === "task_list") {
-				await showTasks(ctx);
-				return { action: "handled" };
-			}
-			intent = { scope: writeScope(result.scope), operation: result.operation };
-		} catch (error) {
+		trace(ctx, "input", { text: event.text, source: event.source });
+		// Typed from Describe changes, the scope is where it was typed; anything else gets the step's own scope.
+		if (event.text === requested) requested = undefined;
+		else intent = undefined;
+		// An unreadable spec stops the conversation rather than guessing at it.
+		try { loadSpec(ctx.cwd); } catch (error) {
 			trace(ctx, "input_blocked", { text: event.text, error: (error as Error).message });
 			ctx.ui.notify(`${(error as Error).message} Nothing was sent to the model.`, "error");
-			return { action: "handled" };
+			return { action: "handled" as const };
 		}
 	});
 
@@ -1167,24 +1126,12 @@ export default function (pi: ExtensionAPI, factory: ClassifierFactory = classifi
 			if (specMode()) { serving = undefined; syncTools(); return; }
 		}
 		serving = delivered ?? unresolved(text);
-		// A confirmed slice takes its baseline now, before the model's first change.
-		if (serving.files?.length && !serving.slice && !stale(serving) && !serving.paused) {
-			try {
-				serving.slice = openSlice(ctx.cwd, serving.files, approvedRoots(ctx));
-				trace(ctx, "slice_started", { request: serving.id, files: serving.files });
-			} catch (error) {
-				serving.paused = `${(error as Error).message} Confirm the slice again.`;
-				ctx.ui.notify(`Pair did not start the slice: ${serving.paused}`, "warning");
-			}
-		}
 		show(ctx);
 		syncTools();
 	});
 
-	/** A model call Pair never resolved: it reads only. */
-	const unresolved = (text: string): Request => ({ id: ++requests, generation: revision, text, kind: "unclear",
-		assistance: preferred().assistance, checkpoint: preferred().checkpoint, defaults: settings,
-		paused: "This reached the model without Pair resolving it." });
+	/** A model call Pair never recorded: it reads only. */
+	const unresolved = (text: string): Request => ({ ...newRequest(text), paused: "This reached the model without Pair recording it." });
 
 	/** read sees the saved file. In Pair, the model is told when the editor holds unsaved changes to it, or cannot say. */
 	pi.on("tool_result", async (event, ctx) => {
@@ -1233,7 +1180,7 @@ export default function (pi: ExtensionAPI, factory: ClassifierFactory = classifi
 			}
 			return;
 		}
-		if (event.toolName === ASK) return;
+		if (event.toolName === ASK || WEB_TOOLS.includes(event.toolName)) return;
 		if (READ_TOOLS.includes(event.toolName)) {
 			// The files under .pi/pi-pair are the developer's view of the spec; the contract is the model's.
 			const home = join(ctx.cwd, HOME);
@@ -1244,7 +1191,7 @@ export default function (pi: ExtensionAPI, factory: ClassifierFactory = classifi
 		}
 		if (event.toolName !== WRITE) {
 			trace(ctx, "tool_blocked", { tool: event.toolName });
-			return { block: true, reason: "Spec plans, it never implements: reading, questions, showing code and pair_write are available here. No shell, edits, delegation or other tools." };
+			return { block: true, reason: "Spec plans, it never implements: reading, web research, questions, showing code and pair_write are available here. No shell, edits, delegation or other tools." };
 		}
 		const contract = currentContract(ctx);
 		if (!allowsWrite(contract!, event.input)) {
@@ -1272,7 +1219,7 @@ export default function (pi: ExtensionAPI, factory: ClassifierFactory = classifi
 		return `Pair is on with the approved spec ${specPath()}; it is the plan, so read a task there before working on it.\n`
 			+ `Goal: ${parsed.goal}\n${parsed.order ? `Order: ${parsed.order}\n` : ""}Tasks:\n`
 			+ view.tasks.map((task) => `${task.id}: ${task.name}${task.completed ? " · done" : task.id === current?.id ? " · next" : ""}`).join("\n")
-			+ "\nThe developer marks a task done from /pair:tasks; say when one looks finished.";
+			+ "\nWhen the current task or agreed slice is implemented and checked, call pair_report; never claim a task is done, as the developer marks it done.";
 	}
 
 	pi.on("context", (event, ctx) => {
@@ -1285,7 +1232,7 @@ export default function (pi: ExtensionAPI, factory: ClassifierFactory = classifi
 		// Ordinary Pair: one contract on every model call, tool continuations included, for the request being served.
 		if (pair && !serving) serving = unresolved("");
 		if (serving) messages.push({ role: "custom", customType: CONTRACT, display: false, timestamp: Date.now(),
-			content: pairGuidance(pairContract(serving, stale(serving), showable())) });
+			content: pairGuidance(pairContract(serving, preferred(), stale(serving), showable())) });
 		return { messages };
 	});
 }

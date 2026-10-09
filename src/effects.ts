@@ -9,7 +9,7 @@ export const within = (root: string, path: string) => path === root || path.star
 const real = (path: string) => { try { return realpathSync.native(path); } catch { return path; } };
 
 /** Where a write to PATH really lands: symlinks in the file and every existing parent resolved against the real project root.
- * Undefined when that is outside every approved root, a root itself, a dangling link, or among Pair's own files.
+ * Undefined when that is outside every approved root, a root itself, a dangling link, or among Pair's own files, in any project.
  * EXTRAROOTS are the external project roots the developer approved for this spec; a target may resolve under any of them. */
 export function landing(root: string, path: string, extraRoots: string[] = []): string | undefined {
 	const project = realpathSync.native(root);
@@ -19,7 +19,7 @@ export function landing(root: string, path: string, extraRoots: string[] = []): 
 	for (let at = resolve(root, path); ;) {
 		try {
 			const found = join(realpathSync.native(at), ...rest);
-			return !roots.includes(found) && roots.some((r) => within(r, found)) && !within(home, found) ? found : undefined;
+			return !roots.includes(found) && roots.some((r) => within(r, found)) && !within(home, found) && !pairFiles(found) ? found : undefined;
 		} catch (error) {
 			if (!["ENOENT", "ENOTDIR"].includes((error as NodeJS.ErrnoException).code ?? "")) return undefined;
 			// Present but unresolvable is a dangling link: writing through it could land anywhere.
@@ -31,6 +31,9 @@ export function landing(root: string, path: string, extraRoots: string[] = []): 
 		}
 	}
 }
+
+/** Another project's .pi/pi-pair is its developer's spec and state: never a target either. */
+const pairFiles = (path: string) => path.split(sep).some((part, i, parts) => part === ".pi" && parts[i + 1] === "pi-pair");
 
 const digest = (bytes: Buffer) => createHash("sha256").update(bytes).digest("hex");
 /** A file's text and version, or nulls when there is no file. */
@@ -53,12 +56,14 @@ export type Slice = {
 	after: Map<string, string>; // The model's own last version of each file it wrote: what review attributes to it.
 };
 
-/** The baseline, taken when the slice starts and before the model's first change. Throws if a target no longer resolves. */
-export function openSlice(root: string, files: string[], extraRoots: string[] = []): Slice {
-	const slice: Slice = { root, extraRoots, targets: new Map(), versions: new Map(), before: new Map(), after: new Map() };
+/** The baseline, taken when files are confirmed and before the model's first change to them; more files join SLICE.
+ * Throws if a target does not resolve or is not a file. */
+export function openSlice(root: string, files: string[], extraRoots: string[] = [],
+	slice: Slice = { root, extraRoots, targets: new Map(), versions: new Map(), before: new Map(), after: new Map() }): Slice {
 	for (const file of files) {
 		const target = landing(root, file, extraRoots);
 		if (!target) throw new Error(`${file} is outside the project or among Pair's own files.`);
+		if (slice.targets.has(target)) continue; // Already confirmed: its baseline stays.
 		if (statSync(target, { throwIfNoEntry: false })?.isFile() === false) throw new Error(`${file} is not a file.`);
 		const { text, version } = snapshot(target);
 		slice.targets.set(target, file);
@@ -74,7 +79,7 @@ export function checkWrite(slice: Slice, path: string, tool: "edit" | "write"): 
 	const name = target && slice.targets.get(target);
 	if (!target || !name) {
 		throw new Error(`${relative(slice.root, resolve(slice.root, path))} is not a file confirmed for this slice (${[...slice.targets.values()].join(", ")}). `
-			+ "Nothing was written; another file needs a new confirmation.");
+			+ "Nothing was written; propose it with pair_files first.");
 	}
 	const now = snapshot(target).version;
 	if (now !== slice.versions.get(target)) {

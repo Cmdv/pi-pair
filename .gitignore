@@ -2,3 +2,7 @@ node_modules/
 # Local planning: kept on disk, never published.
 .pi/
 AGENTS.md
+.DS_Store
+papers/
+*.pdf
+PAIRING-RESEARCH.md

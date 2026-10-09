@@ -5,9 +5,7 @@ import { dirname, join } from "node:path";
 import { test } from "node:test";
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import pair from "../src/index.ts";
-import { classifierStub, readyClassifier } from "./classifier-stub.ts";
-import { decision, type ClassifierFactory } from "../src/classifier.ts";
-import { CONTRACT } from "../src/contracts.ts";
+import { CONTRACT, WEB_TOOLS } from "../src/contracts.ts";
 import { emptyState, stateFile, writeState } from "../src/state.ts";
 import { loadSpec } from "../src/proposals.ts";
 
@@ -15,7 +13,7 @@ process.env.PI_PAIR_EDITOR = "test";
 const SPEC = "# Scope\n\n## Goal\nStay up.\n\n## 1: Backoff\n### Task\nRetry.\n### Proposed solution\nDelay.\n### Done when\nChecked.\n\n## 2: Report\n### Task\nReport.\n### Proposed solution\nShow error.\n### Done when\nVisible.\n";
 const SECTIONS = { Task: "Retry gently.", Research: "Read the client.", "Proposed solution": "Wait and retry.", "Edge cases": "- [ ] E1: Server never answers\n  - Expected: Give up.\n  - Check: Watch the log.", "Done when": "A check observes bounded retries." };
 
-function harness(t: { after: (fn: () => void) => void }, editor?: (method: string, args: any) => unknown, factory: ClassifierFactory = readyClassifier) {
+function harness(t: { after: (fn: () => void) => void }, editor?: (method: string, args: any) => unknown) {
 	const cwd = mkdtempSync(join(tmpdir(), "pi-pair-conversation-"));
 	t.after(() => rmSync(cwd, { recursive: true, force: true }));
 	const handlers = new Map<string, any>();
@@ -33,7 +31,6 @@ function harness(t: { after: (fn: () => void) => void }, editor?: (method: strin
 	let active = ["read", "bash", "write", "edit", "external"];
 	const foreign = new Set<string>(); // Tool names another extension has taken over.
 	let answer: (question: string) => string | undefined = () => undefined;
-	let factoryCalls = 0;
 	let timestamp = 0;
 	const emit = (name: string, event: any = {}) => handlers.get(name)?.(event, ctx);
 	// Pi announces each delivered message, which is when Pair learns which request the model is serving.
@@ -53,7 +50,7 @@ function harness(t: { after: (fn: () => void) => void }, editor?: (method: strin
 			messages.push({ message, options });
 			if (options?.triggerTurn) deliver({ role: "custom", ...message, timestamp: ++timestamp });
 		},
-	} as unknown as ExtensionAPI, async (options) => { factoryCalls++; return factory(options); });
+	} as unknown as ExtensionAPI);
 	const ui = {
 		setStatus: (_key: string, text?: string) => statuses.push(text),
 		setWidget: (_key: string, lines?: string[]) => widgets.push(lines),
@@ -86,13 +83,12 @@ function harness(t: { after: (fn: () => void) => void }, editor?: (method: strin
 	const context = () => emit("context", { messages: history }).messages;
 	const file = join(cwd, ".pi/pi-pair/specs/flow.md");
 	const pick = (match: string) => { ui.select = async (_title, options) => options.find((option) => option.startsWith(match)); };
-	// Rows are unnumbered: the list is in task order, so task N is row N, and only the list answers.
-	const choose = async (id = "1") => { ui.select = async (title, options) => title.startsWith("Spec tasks") ? options[Number(id) - 1] : undefined; await command("pair:tasks"); };
+	const choose = async (id = "1") => { ui.select = async (title, options) => title.startsWith("Spec tasks") ? options.find((option) => option.startsWith(`${id}. `)) : undefined; await command("pair:tasks"); };
 	return { cwd, file, ctx, ui, entries, messages, userMessages, notices, statuses, widgets, sessions, tools, history, asked, foreign, active: () => active,
 		emit, deliver, turn, write, gate, context, command, choose, pick,
 		hash: (id = "1") => loadSpec(file).parsed.tasks.find((task) => task.id === id)!.hash,
 		spec: () => loadSpec(file), answers: (fn: typeof answer) => { answer = fn; },
-		factoryCalls: () => factoryCalls, settle: () => emit("agent_settled"),
+		settle: () => emit("agent_settled"),
 		start: () => emit("session_start"),
 		init: async (tasks = false) => { await command("pair", "Flow"); if (tasks) { writeFileSync(file, SPEC); await choose(); } },
 	};
@@ -100,6 +96,28 @@ function harness(t: { after: (fn: () => void) => void }, editor?: (method: strin
 
 const taskWrite = (h: ReturnType<typeof harness>, id = "1", sections: Record<string, string> = SECTIONS) =>
 	({ kind: "task", id, baseHash: h.hash(id), sections });
+
+test("Spec and Pair task lists show task IDs, not row positions, and leave controls unnumbered", async (t) => {
+	const h = harness(t);
+	await h.init();
+	writeFileSync(h.file, SPEC.replace("## 1:", "## 7:").replace("## 2:", "## 11:"));
+	const lists: string[][] = [];
+	const titles: string[] = [];
+	h.ui.select = async (title, options) => {
+		titles.push(title);
+		if (/^(Spec|Pair) tasks/.test(title)) { lists.push(options); return options[1]; }
+		return undefined;
+	};
+	await h.command("pair:tasks");
+	assert.deepEqual(lists[0], ["7. Backoff · written", "11. Report · written", "+ New task", "Describe changes…", "Cancel", "Show spec file"]);
+	assert.match(titles.at(-1)!, /^Task 11: Report/);
+	const snapshot = h.spec();
+	writeState(stateFile(h.file), { ...snapshot.state, specAgreed: true,
+		tasks: Object.fromEntries(snapshot.parsed.tasks.map((task) => [task.id, { agreedHash: task.hash, completedHash: null }])) });
+	await h.command("pair:tasks");
+	assert.deepEqual(lists[1], ["7. Backoff", "11. Report · next", "Cancel", "Show spec file"]);
+	assert.equal(titles.at(-1), "Task 11: Report");
+});
 
 test("New spec asks for a name with Pair context and an example; cancelling creates nothing", async (t) => {
 	for (const answer of [undefined, "   ", "Reconnect after sleep"]) {
@@ -116,7 +134,6 @@ test("New spec asks for a name with Pair context and an example; cancelling crea
 			return answer;
 		});
 		await h.command("pair");
-		assert.equal(h.factoryCalls(), 0);
 		assert.equal(existsSync(file), !!answer?.trim());
 		if (answer?.trim()) {
 			assert.equal(readFileSync(file, "utf8").startsWith("# Reconnect after sleep\n"), true);
@@ -129,23 +146,21 @@ test("New spec asks for a name with Pair context and an example; cancelling crea
 	}
 });
 
-test("the start is linear: ask the problem, write the whole spec, open the filled file, show the list", async (t) => {
+test("a spec opens automatically only on creation, then opens from Show spec file", async (t) => {
 	const calls: string[] = [];
 	const h = harness(t, (method, args) => {
 		calls.push(method);
 		return method === "handshake" ? { version: 1, editor: "test", capabilities: ["open", "buffer_state"] }
 			: { ok: true, buffers: (args?.paths ?? []).map((path: string) => ({ path, open: false, modified: false })) };
 	});
-	h.start();
+	await h.start();
 	await h.init();
-	// Step 4: an empty spec is not worth looking at, so nothing is opened yet.
-	assert.equal(calls.filter((name) => name === "open").length, 0);
+	// Creation opens the file once, before the model fills it in.
+	assert.equal(calls.filter((name) => name === "open").length, 1);
 	assert.match(h.messages.at(-1).message.content, /^What are you trying to solve\?$/);
-	assert.equal(h.factoryCalls(), 0); // Nothing linear needs the classifier.
 
 	const original = "Original CAPS, punctuation?!";
 	const prompt = await h.turn(original);
-	assert.equal(h.factoryCalls(), 0);
 	assert.equal(prompt.message.display, false);
 	assert.match(prompt.message.content, /"phase": "describe"/);
 	assert.match(prompt.message.content, /"write": "any"/); // One turn writes the goal, the titles and every task.
@@ -176,14 +191,31 @@ test("the start is linear: ask the problem, write the whole spec, open the fille
 	await h.write(taskWrite(h, "1", { Task: "Retry gently, with a cap." }));
 	assert.match(h.messages.at(-1).message.content, /^Saved task 1: Backoff\.$/); // Drafting is over: a change, not progress.
 
-	// Step 8: the file opens filled, and the task list follows, once the model has finished.
+	// The task list follows the model's turn without reopening the file.
 	let offered: string[] = [];
 	h.ui.select = async (_title, options) => { offered = options; return undefined; };
 	await h.settle();
 	assert.equal(calls.filter((name) => name === "open").length, 1);
-	assert.deepEqual(offered, ["Backoff · written · 1 open", "Report · written · 1 open", "+ New task", "Describe changes…", "Cancel"]);
+	assert.deepEqual(offered, ["1. Backoff · written · 1 open", "2. Report · written · 1 open", "+ New task", "Describe changes…", "Cancel", "Show spec file"]);
 	assert.equal(h.widgets.at(-1)?.length, 1); // One line of shortcuts, never two.
 	assert.deepEqual(h.widgets.at(-1), ["/pair:tasks Tasks · /pair:exit Exit Pair"]);
+	await h.command("pair:tasks");
+	await h.choose("1");
+	assert.equal(calls.filter((name) => name === "open").length, 1);
+	h.ui.select = async (title, options) => title.startsWith("Spec tasks") ? options.at(-1) : undefined;
+	await h.command("pair:tasks");
+	assert.equal(calls.filter((name) => name === "open").length, 2);
+	h.ui.select = async () => undefined;
+	await h.command("pair", "flow");
+	assert.equal(calls.filter((name) => name === "open").length, 2);
+	const snapshot = h.spec();
+	writeState(stateFile(h.file), { ...snapshot.state, specAgreed: true,
+		tasks: Object.fromEntries(snapshot.parsed.tasks.map((task) => [task.id, { agreedHash: task.hash, completedHash: null }])) });
+	await h.command("pair:tasks");
+	assert.equal(calls.filter((name) => name === "open").length, 2);
+	h.ui.select = async (title, options) => title.startsWith("Pair tasks") ? options.at(-1) : undefined;
+	await h.command("pair:tasks");
+	assert.equal(calls.filter((name) => name === "open").length, 3);
 });
 
 test("a filled task opens on its summary and choices, not automatic questions or another model turn", async (t) => {
@@ -195,7 +227,8 @@ test("a filled task opens on its summary and choices, not automatic questions or
 	assert.match(h.messages.at(-1).message.content, /^Fill in task 1: Backoff\.$/);
 	assert.equal(h.messages.at(-1).options.triggerTurn, true);
 	assert.match((await h.turn("anything")).message.content, /"phase": "populate"/);
-	assert.equal(h.gate("pair_write", { kind: "task", id: "2" }).block, true);
+	h.ui.select = async () => undefined;
+	await assert.rejects(h.write({ kind: "task", id: "2", sections: SECTIONS }), /did not allow writing task 2; this turn may write task 1 only/);
 	await h.write(taskWrite(h, "1", { ...SECTIONS, Summary: "Retry with a growing delay.",
 		Questions: "- [ ] Q1: Fixed or exponential?\n  - Options: fixed | exponential\n- [ ] Q2: Cap the total wait?" }));
 	assert.deepEqual(h.spec().parsed.tasks[0].questions.map(({ id, checked, text, fields }) => [id, checked, text, fields]),
@@ -237,7 +270,6 @@ test("code records written questions' answers; all answered agrees, partial answ
 			{ label: "Q2", question: "Cap the total wait?", options: [] }]);
 		assert.deepEqual(h.spec().parsed.tasks[0].questions.map(({ checked, fields }) => [checked, fields.Answer]),
 			[[true, "fixed"], [!partial, partial ? undefined : "30 seconds"]]);
-		assert.equal(h.factoryCalls(), 0);
 		if (partial) {
 			assert.equal(h.spec().view.agreed, 0);
 			assert.match(h.messages.at(-1).message.content, /1 still open/);
@@ -246,12 +278,12 @@ test("code records written questions' answers; all answered agrees, partial answ
 		} else {
 			assert.equal(h.spec().state.tasks["1"].agreedHash, h.hash("1"));
 			assert.match(h.messages.at(-1).message.content, /^Task 1: Backoff approved\.$/);
-			assert.deepEqual(menu![1], ["Backoff · agreed", "Report · written", "+ New task", "Describe changes…", "Approve spec", "Cancel"]);
+			assert.deepEqual(menu![1], ["1. Backoff · agreed", "2. Report · written", "+ New task", "Describe changes…", "Approve spec", "Cancel", "Show spec file"]);
 		}
 	}
 });
 
-test("typed changes are user messages, skip triage, and return to the task or list after the turn", async (t) => {
+test("typed changes are user messages, scoped by where they were typed, and return to the task or list after the turn", async (t) => {
 	const h = harness(t);
 	await h.init(true);
 	for (const selected of [true, false]) {
@@ -260,8 +292,6 @@ test("typed changes are user messages, skip triage, and return to the task or li
 		await h.command("pair:tasks");
 		assert.equal(h.userMessages.at(-1), "make the delay longer");
 		const prompt = await h.turn(h.userMessages.at(-1)!, "extension");
-		assert.equal(h.factoryCalls(), 0);
-		assert.match(prompt.message.content, /"developerWants": "edit"/);
 		assert.match(prompt.message.content, selected ? /"write": "task"/ : /"write": "any"/);
 		if (!selected) {
 			assert.ok(prompt.message.content.includes("## 2: Report")); // Cross-task edits carry the content; reading the spec is forbidden.
@@ -305,14 +335,14 @@ test("approving a task returns to the list, where one agreed task makes the spec
 	assert.equal(h.spec().view.ready, false); // Approving a task is not approving the spec.
 	assert.match(h.messages.at(-1).message.content, /^Task 1: Backoff approved\.$/);
 	// Step 17: back to the list, which now offers the spec.
-	assert.deepEqual(offered, ["Backoff · agreed", "Report · written", "+ New task", "Describe changes…", "Approve spec", "Cancel"]);
+	assert.deepEqual(offered, ["1. Backoff · agreed", "2. Report · written", "+ New task", "Describe changes…", "Approve spec", "Cancel", "Show spec file"]);
 	assert.deepEqual(h.widgets.at(-1), ["/pair:approve Approve spec · /pair:tasks Tasks · /pair:exit Exit Pair"]);
 
 	// Step 13 again, from the review dialog this time: 2 has no questions, so Agree is right there.
 	const titles: string[] = [];
 	h.ui.select = async (title, options) => {
 		titles.push(title); offered = options;
-		return options.find((option) => option.startsWith("Report")) ?? (options.includes("Agree") ? "Agree" : undefined);
+		return options.find((option) => option.startsWith("2. Report")) ?? (options.includes("Agree") ? "Agree" : undefined);
 	};
 	await h.command("pair:tasks");
 	assert.deepEqual([h.spec().view.agreed, h.messages.at(-1).message.content], [2, "Task 2: Report approved."]);
@@ -326,7 +356,7 @@ test("approving a task returns to the list, where one agreed task makes the spec
 	assert.equal(h.messages.at(-1).message.content,
 		"I've now put us into pairing mode with spec flow. This is the order I advise we do it in:\n1. Backoff\n2. Report\nMark each done from /pair:tasks as it lands; /pair:next starts the next one in a fresh session.");
 	assert.equal(h.statuses.at(-1), "🧑‍🤝‍🧑 Pair: flow · 1/2 · you drive · hints"); // Approved: Pair is working on it, task 1 first.
-	assert.deepEqual(h.widgets.at(-1), ["/pair:tasks Tasks · /pair:settings Settings · /pair:exit Exit Pair"]);
+	assert.deepEqual(h.widgets.at(-1), ["/pair:tasks Tasks · /pair:profile Profile · /pair:exit Exit Pair"]);
 	assert.ok(h.entries.some((entry) => entry.customType === "pi-pair-trace" && entry.data.event === "approved"));
 
 	// An empty task has nothing to approve, and the spec cannot be approved before any task is.
@@ -353,39 +383,37 @@ test("a new task can be added from the list and is filled in like any other", as
 	assert.equal(h.statuses.at(-1), "🧑‍🤝‍🧑 Spec: 3/3");
 });
 
-test("review messages are triaged: the scope widens the turn, and the list is reachable from anywhere", async (t) => {
-	const h = harness(t, undefined, classifierStub({ scope: "this_task", operation: "edit" }));
+test("Q2: a write outside the turn's scope asks the developer first, one key per write; declined or late, nothing is written", async (t) => {
+	const h = harness(t);
 	await h.init(true);
-	// A message about the selected task keeps the turn inside it.
-	assert.match((await h.turn("make the delay longer")).message.content, /"write": "task"/);
-	assert.equal(h.factoryCalls(), 1);
-	assert.equal(h.gate("pair_write", { kind: "task", id: "2" }).block, true);
-	assert.equal(h.gate("pair_write", taskWrite(h)), undefined);
-
-	// Asking about another task widens the turn; the model resolves which one, and the selection is unchanged.
-	const other = harness(t, undefined, classifierStub({ scope: "other_task", operation: "add" }));
-	await other.init(true);
-	const prompt = await other.turn("add an edge case to the reporting task");
-	assert.match(prompt.message.content, /"write": "any"/);
-	assert.match(prompt.message.content, /"developerWants": "add"/);
-	assert.equal(other.gate("pair_write", taskWrite(other, "2", { Task: "Report clearly." })), undefined);
-	assert.equal(other.statuses.at(-1), "🧑‍🤝‍🧑 Spec: 1/2");
-
-	// Goal and new-task requests may write the list, never a task's content.
-	const goal = harness(t, undefined, classifierStub({ scope: "goal", operation: "edit" }));
-	await goal.init(true);
-	assert.match((await goal.turn("the goal should mention latency")).message.content, /"write": "tasks"/);
-	assert.equal(goal.gate("pair_write", { kind: "tasks", goal: "Stay up and stay fast." }), undefined);
-	assert.equal(goal.gate("pair_write", taskWrite(goal)).block, true);
-
-	// Going back to the list is navigation: code handles it, and the model is never called.
-	const list = harness(t, undefined, classifierStub({ scope: "task_list" }));
-	await list.init(true);
-	let offered: string[] = [];
-	list.ui.select = async (_title, options) => { offered = options; return undefined; };
-	assert.deepEqual(await list.emit("input", { text: "take me back to the tasks", source: "rpc" }), { action: "handled" });
-	assert.deepEqual(offered, ["Backoff · written", "Report · written", "+ New task", "Describe changes…", "Cancel"]);
-	assert.equal(list.statuses.at(-1), "🧑‍🤝‍🧑 Spec: flow");
+	assert.match((await h.turn("the reporting task needs an edge case")).message.content, /"write": "task"/);
+	assert.match(h.context().at(-1).content, /a write outside it asks the developer first, so make one only when they asked for it/);
+	const asked: [string, string[]][] = [];
+	let answer: string | undefined = "Allow this write";
+	h.ui.select = async (title, options) => { asked.push([title, options]); return answer; };
+	// Inside the scope: no question.
+	await h.write(taskWrite(h, "1", { Task: "Retry gently." }));
+	assert.equal(asked.length, 0);
+	// Another task: asked, allowed, written.
+	await h.write(taskWrite(h, "2", { Task: "Report each retry." }));
+	assert.deepEqual(asked, [["The model wants to write task 2: Report. This turn may write task 1 only.", ["Allow this write", "Cancel"]]]);
+	assert.match(h.spec().text, /Report each retry\./);
+	// The goal or a new task: asked again; Cancel refuses it and nothing changes.
+	answer = "Cancel";
+	const before = h.spec().text;
+	await assert.rejects(h.write({ kind: "tasks", names: ["Sneaked in"] }),
+		/^Error: The developer did not allow writing the goal, order or task list, adding Sneaked in; this turn may write task 1 only\. Ask in chat instead\.$/);
+	assert.equal(asked.at(-1)![0], "The model wants to write the goal, order or task list, adding Sneaked in. This turn may write task 1 only.");
+	assert.equal(h.spec().text, before);
+	// An answer that lands after Stop allows nothing.
+	let release!: (value: string) => void;
+	h.ui.select = () => new Promise<string>((resolve) => { release = resolve; });
+	const late = h.write(taskWrite(h, "2", { Task: "Late." }));
+	await new Promise((resolve) => setImmediate(resolve));
+	await h.command("pair:exit");
+	release("Allow this write");
+	await assert.rejects(late, /did not allow writing task 2/);
+	assert.doesNotMatch(h.spec().text, /Late\./);
 });
 
 test("Spec plans and never implements, whatever the conversation says", async (t) => {
@@ -400,8 +428,8 @@ test("Spec plans and never implements, whatever the conversation says", async (t
 		for (const tool of ["write", "edit", "bash", "external", "subagent"]) assert.equal(h.gate(tool).block, true);
 	}
 	assert.match(h.gate("write").reason, /Spec plans, it never implements/);
-	// The tool refuses out-of-scope payloads even if the gate is never consulted.
-	await assert.rejects(h.write({ kind: "tasks", names: ["Sneaked in"] }), /Outside this turn's scope: it may write task 1 only/);
+	// The tool asks before an out-of-scope payload; unanswered, it is refused.
+	await assert.rejects(h.write({ kind: "tasks", names: ["Sneaked in"] }), /The developer did not allow writing the goal, order or task list, adding Sneaked in; this turn may write task 1 only/);
 	await h.command("pair:exit");
 	assert.equal(h.gate("write"), undefined);
 	assert.deepEqual([h.statuses.at(-1), h.widgets.at(-1)], [undefined, undefined]);
@@ -486,17 +514,6 @@ test("handoff needs an approved spec, and hands the next task over with the spec
 	assert.equal(sent[0][1].triggerTurn, false);
 });
 
-test("without the local triage model, messages reach the model unchanged and nothing else breaks", async (t) => {
-	const h = harness(t, undefined, async () => { throw new Error("ONNX Runtime is unavailable"); });
-	await h.init(true);
-	assert.equal(await h.emit("input", { text: "make the delay longer", source: "rpc" }), undefined);
-	assert.match(h.notices.at(-1)!, /Local triage model unavailable.*ONNX Runtime is unavailable/);
-	assert.match((await h.turn("make the delay longer")).message.content, /"write": "task"/);
-	assert.equal(h.factoryCalls(), 1); // Tried once, then left alone.
-	assert.equal(h.notices.length, 1);
-	assert.equal(h.gate("read"), undefined);
-});
-
 test("an approved spec puts Pair to work: the plan in the prompt, ordinary tools back, tasks marked done from the list", async (t) => {
 	const h = harness(t);
 	await h.init(true);
@@ -510,7 +527,7 @@ test("an approved spec puts Pair to work: the plan in the prompt, ordinary tools
 		+ "1 before 2: the report needs the retry in place.\nMark each done from /pair:tasks as it lands; /pair:next starts the next one in a fresh session.");
 	assert.equal(h.messages.at(-1).message.details.badge, "Spec");
 	assert.equal(h.statuses.at(-1), "🧑‍🤝‍🧑 Pair: flow · 1/2 · you drive · hints");
-	assert.deepEqual(h.widgets.at(-1), ["/pair:tasks Tasks · /pair:settings Settings · /pair:exit Exit Pair"]);
+	assert.deepEqual(h.widgets.at(-1), ["/pair:tasks Tasks · /pair:profile Profile · /pair:exit Exit Pair"]);
 	// Pair with a spec attached: no turn contract, nothing blocked, and the plan in the system prompt.
 	const prompt = await h.turn("let's start");
 	assert.equal(prompt.message, undefined);
@@ -518,8 +535,8 @@ test("an approved spec puts Pair to work: the plan in the prompt, ordinary tools
 	// No Spec contract: one Pair request contract, with the developer driving by default.
 	const contracts = h.context().filter((message: any) => message.customType === CONTRACT);
 	assert.equal(contracts.length, 1);
-	assert.match(contracts[0].content, /^Pair request contract\n[\s\S]*"developerSaid": "let's start"[\s\S]*"driver": "human"/);
-	assert.match(h.gate("bash").reason, /^While pairing the model reads, asks and shows code; bash is not available/);
+	assert.match(contracts[0].content, /^Pair request contract\nRequest \d+; [^\n]*\nProfile: you drive · hints · each step\.\nTask: 1: Backoff\.\nThe developer drives: don't edit files\./);
+	assert.equal(h.gate("bash", { command: "git status --short" }), undefined);
 	assert.equal(h.gate("read", { path: ".pi/pi-pair/specs/flow.md" }), undefined); // The plan is read, now that it is the plan.
 	await assert.rejects(h.write(taskWrite(h, "1")), /it may write nothing/);
 	await h.command("pair:approve");
@@ -529,26 +546,26 @@ test("an approved spec puts Pair to work: the plan in the prompt, ordinary tools
 	const offered: string[][] = [];
 	h.ui.select = async (title, options) => {
 		titles.push(title); offered.push(options);
-		return title.startsWith("Pair tasks") ? options.find((option) => option.startsWith("Backoff")) : options.find((option) => option === "Mark task as done");
+		return title.startsWith("Pair tasks") ? options.find((option) => option.startsWith("1. Backoff")) : options.find((option) => option === "Mark task as done");
 	};
 	await h.command("pair:tasks");
 	assert.deepEqual(titles, ["Pair tasks · flow", "Task 1: Backoff", "Pair tasks · flow", "Task 1: Backoff · done"]);
-	assert.deepEqual(offered, [["Backoff · next", "Report", "Cancel"], ["Implement task", "Implement task + prompt", "Mark task as done", "Cancel"],
-		["Backoff · done", "Report · next", "Cancel"], ["Reset task", "Go back"]]);
+	assert.deepEqual(offered, [["1. Backoff · next", "2. Report", "Cancel", "Show spec file"], ["Implement task", "Implement task + prompt", "Mark task as done", "Cancel"],
+		["1. Backoff · done", "2. Report · next", "Cancel", "Show spec file"], ["Reset task", "Go back"]]);
 	assert.deepEqual([h.spec().view.completed, h.spec().state.tasks["1"].completedHash], [1, h.hash("1")]);
 	assert.equal(h.messages.at(-1).message.content, "Task 1: Backoff done. Next: task 2: Report.");
 	assert.equal(h.messages.at(-1).message.details.badge, "Pair");
 	assert.equal(h.statuses.at(-1), "🧑‍🤝‍🧑 Pair: flow · 2/2 · you drive · hints");
 	// Marked by mistake: a reset keeps the agreement, drops the completion, and returns to the list.
 	let visits = 0;
-	h.ui.select = async (title) => title.startsWith("Pair tasks") ? (visits++ ? "Cancel" : "Backoff · done") : "Reset task";
+	h.ui.select = async (title) => title.startsWith("Pair tasks") ? (visits++ ? "Cancel" : "1. Backoff · done") : "Reset task";
 	await h.command("pair:tasks");
 	assert.equal(visits, 2);
 	assert.deepEqual([h.spec().view.completed, h.spec().state.tasks["1"]], [0, { agreedHash: h.hash("1"), completedHash: null }]);
 	assert.equal(h.messages.at(-1).message.content, "Task 1: Backoff is no longer done.");
 	assert.equal(h.statuses.at(-1), "🧑‍🤝‍🧑 Pair: flow · 1/2 · you drive · hints");
 	// Implement hands the task to the model in this session, with the developer's note when they add one.
-	h.ui.select = async (title, options) => title.startsWith("Pair tasks") ? options.find((option) => option.startsWith("Report")) : "Implement task + prompt";
+	h.ui.select = async (title, options) => title.startsWith("Pair tasks") ? options.find((option) => option.startsWith("2. Report")) : "Implement task + prompt";
 	h.answers(() => "Start with the error path.");
 	await h.command("pair:tasks");
 	assert.equal(h.asked.at(-1), "Task 2: Report");
@@ -556,11 +573,11 @@ test("an approved spec puts Pair to work: the plan in the prompt, ordinary tools
 	assert.equal(h.messages.at(-1).options.triggerTurn, true);
 	assert.equal(h.statuses.at(-1), "🧑‍🤝‍🧑 Pair: flow · 2/2 · you drive · hints"); // The task being implemented is the current one.
 	assert.match((await h.turn("go on")).systemPrompt, /Tasks:\n1: Backoff\n2: Report · next\n/);
-	h.ui.select = async (title, options) => title.startsWith("Pair tasks") ? options.find((option) => option.startsWith("Report")) : "Implement task";
+	h.ui.select = async (title, options) => title.startsWith("Pair tasks") ? options.find((option) => option.startsWith("2. Report")) : "Implement task";
 	await h.command("pair:tasks");
 	assert.equal(h.messages.at(-1).message.content, "Pair on task 2: Report from .pi/pi-pair/specs/flow.md. Read the task first: the spec is the plan, and its discussion is already settled there.");
 	// Done, task by task, until the list has nothing left to pick.
-	h.ui.select = async (title, options) => title.startsWith("Pair tasks") ? options.find((option) => !option.endsWith("· done") && option !== "Cancel") : "Mark task as done";
+	h.ui.select = async (title, options) => title.startsWith("Pair tasks") ? options.find((option) => /^\d+\. /.test(option) && !option.endsWith("· done")) : "Mark task as done";
 	await h.command("pair:tasks");
 	assert.equal(h.messages.at(-1).message.content, "Task 2: Report done. Every task is done.");
 	assert.equal(h.statuses.at(-1), "🧑‍🤝‍🧑 Pair: flow · done · you drive · hints");
@@ -585,6 +602,15 @@ test("Spec never reads its own files: the contract carries the spec, and the fil
 	assert.equal(h.gate("grep", { pattern: "retry" }), undefined);
 });
 
+/** The profile dialog, one tab at a time as askEach puts it: each value picks the option it starts. Other dialogs get nothing. */
+const TABS = ["Who writes the code?", "How much help while you drive?", "When does Pair stop for you?"];
+const profileOf = (...values: string[]) => (title: string, options: string[]) => {
+	const i = TABS.indexOf(title);
+	return i < 0 ? undefined : options.find((option) => option.startsWith(values[i]));
+};
+const guided = profileOf("You", "Hints", "Each step");
+const driving = profileOf("The model", "Solution", "After a slice");
+
 test("/pair offers pairing with an approved spec or editing any; editing an approved spec withdraws its approval", async (t) => {
 	const h = harness(t);
 	await h.init(true);
@@ -603,7 +629,7 @@ test("/pair offers pairing with an approved spec or editing any; editing an appr
 	titles.length = 0; offered.length = 0;
 	h.ui.select = async (title, options) => { titles.push(title); offered.push(options); return title === "Pair" ? "Pair with spec" : title === "Pair with spec" ? "flow" : undefined; };
 	await h.command("pair");
-	assert.deepEqual([titles, offered[1]], [["Pair", "Pair with spec", "Pair settings · now Guide me (default): you drive · hints · check in each step", "Pair tasks · flow"], ["flow"]]);
+	assert.deepEqual([titles, offered[1]], [["Pair", "Pair with spec", "Who writes the code?", "Pair tasks · flow"], ["flow"]]);
 	assert.equal(h.statuses.at(-1), "🧑‍🤝‍🧑 Pair: flow · 1/2 · you drive · hints");
 	// Edit spec on an approved spec withdraws the approval: Spec is back, with its list and its limits.
 	titles.length = 0;
@@ -624,247 +650,345 @@ test("/pair offers pairing with an approved spec or editing any; editing an appr
 
 const approveAll = (h: ReturnType<typeof harness>) => writeState(stateFile(h.file),
 	{ tasks: Object.fromEntries(h.spec().parsed.tasks.map((task) => [task.id, { agreedHash: task.hash, completedHash: null }])), specAgreed: true });
-const lastSettings = (h: ReturnType<typeof harness>) => h.entries.findLast((entry) => entry.customType === "pi-pair")?.data.settings;
-const DEFAULT_TITLE = "Pair settings · now Guide me (default): you drive · hints · check in each step";
-
-test("Pair no spec asks how to pair in code; a cancelled choice stays an unconfirmed Guide me", async (t) => {
+test("Pair no spec asks for a profile in code and keeps it in memory for the session; a cancelled choice saves nothing", async (t) => {
 	const h = harness(t);
 	const titles: string[] = [];
 	h.ui.select = async (title) => { titles.push(title); return title === "Pair" ? "Pair no spec" : undefined; };
 	await h.command("pair");
-	assert.deepEqual(titles, ["Pair", DEFAULT_TITLE]);
+	assert.deepEqual(titles, ["Pair", "Who writes the code?"]);
 	assert.match(h.statuses.at(-1)!, / Pair · you drive · hints$/);
-	assert.deepEqual(h.widgets.at(-1), ["/pair:settings Settings · /pair:exit Exit Pair"]);
-	assert.equal(lastSettings(h), undefined);
-	// Still unconfirmed, so it is asked again; Drive and review is a preference, and the developer still drives.
-	h.ui.select = async (title, options) => title === "Pair" ? "Pair no spec" : options.find((option) => option.startsWith("Drive and review"));
-	await h.command("pair");
-	assert.match(h.statuses.at(-1)!, / Pair · you drive · model preferred · solution$/);
-	assert.match(h.messages.at(-1).message.content, /^Pair settings: Drive and review, .*The model edits only a slice you confirm/);
-	assert.deepEqual(lastSettings(h), { driver: "model", assistance: "solution", checkpoint: "after_slice" });
+	assert.deepEqual(h.widgets.at(-1), ["/pair:profile Profile · /pair:exit Exit Pair"]);
+	// Still unchosen, so it is asked again; the model driving is a profile, and nothing is granted until files are confirmed.
+	await pairNoSpec(h, driving);
+	assert.match(h.statuses.at(-1)!, / Pair · model driving · after a slice$/);
+	assert.equal(h.messages.at(-1).message.content, "Pair profile: model drives · solution · after a slice. The model edits only files you confirm.");
 	titles.length = 0;
 	h.ui.select = async (title) => { titles.push(title); return title === "Pair" ? "Pair no spec" : undefined; };
 	await h.command("pair");
-	assert.deepEqual(titles, ["Pair"]); // Confirmed, so not asked again.
-	assert.equal(h.factoryCalls(), 0);
+	assert.deepEqual(titles, ["Pair"]); // Chosen, so not asked again.
+	// Never saved in the session: a new session starts from the starting profile and asks again.
+	assert.equal(h.entries.some((entry) => entry.customType === "pi-pair" && ("profile" in entry.data || "settings" in entry.data)), false);
+	h.start();
+	assert.match(h.statuses.at(-1)!, / Pair · you drive · hints$/);
+	titles.length = 0;
+	await h.command("pair");
+	assert.deepEqual(titles, ["Pair", "Who writes the code?"]);
 	assert.equal(h.messages.some((message) => message.options?.triggerTurn), false);
 });
 
-test("settings change one at a time, follow the work and /pair:next, and resume only from the active branch", async (t) => {
+test("the profile is saved with the spec, the latest choice winning; it follows tasks and /pair:next, and session settings never count", async (t) => {
 	const h = harness(t);
 	await h.init(true);
 	approveAll(h);
 	h.ui.select = async (title, options) => title === "Pair" ? "Pair with spec" : title === "Pair with spec" ? "flow"
-		: title.startsWith("Pair settings") ? options.find((option) => option.startsWith("Build together")) : undefined;
+		: profileOf("You", "Examples", "Each step")(title, options);
 	await h.command("pair");
 	assert.match(h.statuses.at(-1)!, /Pair: flow · 1\/2 · you drive · examples$/);
-	assert.deepEqual(lastSettings(h), { driver: "human", assistance: "examples", checkpoint: "each_step" });
-	assert.equal(h.messages.at(-1).message.content, "Pair settings: Build together, you drive · examples · check in each step.");
+	assert.deepEqual(h.spec().state.profile, { driver: "human", assistance: "examples", checkpoint: "each_step" });
+	assert.equal(h.messages.at(-1).message.content, "Pair profile: you drive · examples · each step.");
 
-	// More help without handing over the keyboard.
+	// The dialog opens on the current values, and the latest choice wins.
 	const solo = { driver: "human", assistance: "solution", checkpoint: "after_slice" };
-	const answers: Record<string, string> = { "Who drives by default?": "You drive", "How much help?": "Solution", "When does Pair check in?": "After a slice" };
-	h.ui.select = async (title) => title.startsWith("Pair settings") ? "Adjust driver, help and check-ins…" : answers[title];
-	await h.command("pair:settings");
-	assert.deepEqual(lastSettings(h), solo);
+	const offered: string[][] = [];
+	h.ui.select = async (title, options) => { offered.push(options); return profileOf("You", "Solution", "After a slice")(title, options); };
+	await h.command("pair:profile");
+	assert.deepEqual(offered.map((options) => options[0]), ["You (current)", "Examples (current)", "Each step (current)"]);
+	assert.deepEqual(h.spec().state.profile, solo);
 	assert.match(h.statuses.at(-1)!, / you drive · solution$/);
-	// Cancelling at any step changes nothing.
-	for (const stop of ["Pair settings", "Who drives", "How much help", "When does"]) {
-		h.ui.select = async (title, options) => title.startsWith(stop) ? undefined
-			: title.startsWith("Pair settings") ? "Adjust driver, help and check-ins…" : options.at(-1);
-		await h.command("pair:settings");
-		assert.deepEqual(lastSettings(h), solo, stop);
-	}
+	// Cancelling, or a typed answer, changes nothing.
+	h.ui.select = async () => undefined;
+	await h.command("pair:profile");
+	h.ui.select = async (title) => title === TABS[0] ? "Other…" : undefined;
+	h.answers(() => "The model");
+	await h.command("pair:profile");
+	h.answers(() => undefined);
+	assert.deepEqual(h.spec().state.profile, solo);
 
-	// A task change and /pair:next keep the preferences.
-	h.ui.select = async (title, options) => title.startsWith("Pair tasks") ? options.find((option) => option.startsWith("Report")) : "Implement task";
+	// The session carries no profile, so a task change and /pair:next keep the spec's, and the fresh session uses it without asking.
+	h.ui.select = async (title, options) => title.startsWith("Pair tasks") ? options.find((option) => option.startsWith("2. Report")) : "Implement task";
 	await h.command("pair:tasks");
-	assert.deepEqual(h.entries.findLast((entry) => entry.customType === "pi-pair").data, { pair: true, spec: "flow", selection: "2", settings: solo });
+	assert.deepEqual(h.entries.findLast((entry) => entry.customType === "pi-pair").data, { pair: true, spec: "flow", selection: "2" });
 	await h.command("pair:next");
 	const kept: any[] = [];
 	await h.sessions[0].setup({ appendCustomEntry: (_type: string, data: any) => kept.push(data) });
-	assert.deepEqual(kept, [{ pair: true, spec: "flow", selection: "2", settings: solo }]);
-
-	// Resume reads the active branch: a branch from before the choice has none, and malformed settings are none.
+	assert.deepEqual(kept, [{ pair: true, spec: "flow", selection: "2" }]);
 	const sessionManager = h.ctx.sessionManager as any;
-	const first = h.entries.findIndex((entry) => entry.data?.settings);
-	sessionManager.getBranch = () => h.entries.slice(0, first);
-	h.emit("session_tree");
-	assert.match(h.statuses.at(-1)!, / you drive · hints$/);
-	sessionManager.getBranch = () => h.entries;
+	const asked: string[] = [];
+	h.ui.select = async (title) => { asked.push(title); return undefined; };
+	sessionManager.getBranch = () => kept.map((data) => ({ type: "custom", customType: "pi-pair", data }));
+	h.start();
+	assert.match(h.statuses.at(-1)!, / you drive · solution$/);
+	assert.deepEqual(asked, []);
+
+	// E4: old session settings never count; without a saved profile the starting one applies, and grants nothing.
+	sessionManager.getBranch = () => [{ type: "custom", customType: "pi-pair",
+		data: { pair: true, spec: "flow", settings: { driver: "model", assistance: "solution", checkpoint: "after_slice" } } }];
 	h.emit("session_tree");
 	assert.match(h.statuses.at(-1)!, / you drive · solution$/);
-	h.entries.push({ type: "custom", customType: "pi-pair", data: { pair: true, spec: "flow", settings: { driver: "model", assistance: "everything", checkpoint: "after_slice" } } });
+	const { profile: _dropped, ...unchosen } = h.spec().state;
+	writeState(stateFile(h.file), unchosen);
 	h.emit("session_tree");
 	assert.match(h.statuses.at(-1)!, / you drive · hints$/);
+	assert.equal(h.gate("edit", { path: "src/retry.ts" }).block, true);
+
+	// E5: a reply that lands after Stop saves nothing.
+	let release!: (value: string) => void;
+	let reached!: () => void;
+	const opened = new Promise<void>((resolve) => { reached = resolve; });
+	h.ui.select = (title) => title === TABS[0] ? (reached(), new Promise<string>((resolve) => { release = resolve; })) : Promise.resolve(undefined);
+	const late = h.command("pair:profile");
+	await opened;
+	await h.command("pair:exit");
+	release("The model");
+	await late;
+	assert.equal(h.spec().state.profile, undefined);
 });
 
-test("a model slice needs confirmed files, grants nothing when cancelled or stale, is never saved and hands back at review", async (t) => {
+test("the model driving proposes its files once it starts; only Confirm grants them, for this request, and review hands back", async (t) => {
 	const h = harness(t);
 	await h.init(true);
 	approveAll(h);
-	h.ui.select = async (title, options) => title === "Pair" ? "Pair with spec" : title === "Pair with spec" ? "flow"
-		: title.startsWith("Pair settings") ? options.find((option) => option.startsWith("Drive and review")) : undefined;
+	mkdirSync(join(h.cwd, "src"));
+	h.ui.select = async (title, options) => title === "Pair" ? "Pair with spec" : title === "Pair with spec" ? "flow" : driving(title, options);
 	await h.command("pair");
-	const preferring = / Pair: flow · 1\/2 · you drive · model preferred · solution$/;
-	assert.match(h.statuses.at(-1)!, preferring);
-	const turns = () => h.messages.filter((message) => message.options?.triggerTurn).length;
-	const handoffs: string[] = [];
-	const start = (confirm: (string | undefined)[], files: string[] = []) => {
-		const toType = [...files];
-		h.ui.select = async (title, options) => title.startsWith("Pair tasks") ? options.find((option) => option.startsWith("Backoff"))
-			: title === "Task 1: Backoff" ? "Implement task"
-			: title.startsWith("Choose files") ? typeFiles(() => toType.length)(options)
-			: (handoffs.push(title), confirm.shift());
-		h.answers(() => toType.shift());
-		return h.command("pair:tasks");
-	};
+	const profiled = / Pair: flow · 1\/2 · model driving · after a slice$/;
+	assert.match(h.statuses.at(-1)!, profiled);
+	// Implement task starts the turn at once: no handoff dialog, and nothing granted yet.
+	const titles: string[] = [];
+	h.ui.select = async (title, options) => { titles.push(title); return title.startsWith("Pair tasks") ? options.find((option) => option.startsWith("1. Backoff"))
+		: title === "Task 1: Backoff" ? "Implement task" : undefined; };
+	await h.command("pair:tasks");
+	assert.deepEqual(titles, ["Pair tasks · flow", "Task 1: Backoff"]);
+	assert.match(h.messages.at(-1).message.content, /^Pair on task 1: Backoff from .*settled there\.$/s);
+	assert.equal(h.messages.at(-1).options.triggerTurn, true);
+	assert.match(pairContracts(h)[0], /^Task: 1: Backoff\.\nNo files confirmed yet\.$/m);
+	assert.deepEqual(h.active(), ["read", "bash", "grep", "find", "ls", "pair_ask", "pair_profile", "pair_files", "pair_report"]);
+	assert.match(h.gate("edit", { path: "src/retry.ts" }).reason, /^Propose the files with pair_files first/);
 
-	await start(["Cancel"]);
-	assert.equal(turns(), 0);
-	assert.match(h.statuses.at(-1)!, preferring);
+	// Invalid proposals never reach the developer; Cancel grants nothing.
+	for (const [path, reason] of [["../outside.ts", /outside the project, or among Pair's own files/], [".pi/pi-pair/specs/flow.md", /among Pair's own files/],
+		["src", /src is not a file; propose files, not directories/]] as const) {
+		await assert.rejects(proposeFiles(h, [path]), reason, path);
+	}
+	assert.equal(await said(proposeFiles(h, ["src/retry.ts"], "Cancel")), "The developer cancelled: change none of src/retry.ts. Ask in chat what they want instead.");
+	assert.match(h.gate("edit", { path: "src/retry.ts" }).reason, /^Propose the files with pair_files first/);
 
-	// Confirm needs files; invalid ones are refused; adjusting files only brings the summary back.
-	handoffs.length = 0;
-	await start(["Confirm", "Choose files…", "Confirm"],
-		["../outside.ts", ".pi/pi-pair/specs/flow.md", "src/retry.ts, src/retry.ts test/retry.test.ts"]);
-	assert.equal(handoffs.length, 3);
-	assert.equal(handoffs[0], "Hand task 1: Backoff to the model?\nDriver: the model for this slice, then you again at review · Help: solution · Check-in: after a slice\n"
-		+ "Behaviour: Retry.\nFiles: none yet; Choose files to pick them");
-	assert.match(handoffs[2], /\nFiles: src\/retry\.ts, test\/retry\.test\.ts$/);
-	assert.deepEqual(h.notices.slice(-3), ["Choose the files the model may change before confirming.",
-		"../outside.ts is not a project file the model may change.", ".pi/pi-pair/specs/flow.md is not a project file the model may change."]);
-	assert.equal(turns(), 1);
-	assert.match(h.messages.at(-1).message.content, /^Implement task 1: Backoff .*\n\nConfirmed slice: change only src\/retry\.ts, test\/retry\.test\.ts\. Stop when this slice is done/s);
-	assert.match(h.statuses.at(-1)!, / model driving this slice · solution$/);
+	// Confirm: exactly these files, for this request, from now; the status says so while the developer is asked.
+	let shown = "";
+	let during: string | undefined;
+	assert.equal(await said(proposeFiles(h, ["src/retry.ts", "test/retry.test.ts", "src/retry.ts"], async (title) => { shown = title; during = h.statuses.at(-1); return "Confirm"; })),
+		"Confirmed: src/retry.ts, test/retry.test.ts. Change only src/retry.ts, test/retry.test.ts, with edit for files that exist and write only for new ones.");
+	assert.equal(shown, "The model proposes to change:\n  src/retry.ts — Add retry.\n  test/retry.test.ts — Add retry.\n"
+		+ "Confirm lets it edit exactly these until it stops; Cancel lets it edit none of them.");
+	assert.match(during!, / model driving · after a slice · confirm files$/);
+	assert.match(h.statuses.at(-1)!, / model driving · after a slice · 2 files confirmed$/);
+	assert.deepEqual(h.active(), ["read", "bash", "write", "edit", "grep", "find", "ls", "pair_ask", "pair_profile", "pair_files", "pair_report"]);
+	assert.match(pairContracts(h)[0], /^Confirmed files: src\/retry\.ts, test\/retry\.test\.ts\.$/m);
+	// Extended: only the new file is asked about.
+	await proposeFiles(h, ["src/retry.ts", "src/util.ts"], async (title) => { shown = title; return "Confirm"; });
+	assert.match(shown, /^The model proposes to change, besides the files already confirmed:\n  src\/util\.ts — Add retry\.\n/);
+	assert.equal(await said(proposeFiles(h, ["src/util.ts"])), "Already confirmed: src/retry.ts, test/retry.test.ts, src/util.ts.");
 	assert.equal(h.entries.some((entry) => entry.customType === "pi-pair" && JSON.stringify(entry.data).includes("retry")), false);
+	assert.equal(h.spec().state.targets, undefined);
 
-	// The review boundary: the turn settles once, and the developer drives again until the next request.
+	// The review boundary: the turn settles once, the files close, and the next request starts with none.
 	await h.settle();
-	assert.match(h.statuses.at(-1)!, / you drive · model preferred · solution · review$/);
-	assert.match(h.messages.at(-1).message.content, /^The model's slice of task 1: Backoff is finished, and you are driving again\./);
+	assert.match(h.statuses.at(-1)!, / model driving · after a slice · review$/);
+	assert.match(h.messages.at(-1).message.content, /^The model's slice of task 1: Backoff is finished, and its files are closed\. No files changed\./);
+	assert.deepEqual(h.spec().state.tasks["1"], { agreedHash: h.hash("1"), completedHash: null }); // Reviewed, never marked done by Pair.
 	await h.turn("What changed?");
-	assert.match(h.statuses.at(-1)!, preferring);
+	assert.match(h.statuses.at(-1)!, profiled);
+	assert.match(pairContracts(h)[0], /^No files confirmed yet\.$/m);
+	assert.match(h.gate("edit", { path: "src/retry.ts" }).reason, /^Propose the files with pair_files first/);
 	await h.settle();
-	assert.equal(h.messages.filter((message) => /driving again/.test(message.message.content)).length, 1);
+	assert.equal(h.messages.filter((message) => /files are closed/.test(message.message.content)).length, 1);
 
-	// Resuming never brings a slice back, even mid-turn.
-	await start(["Choose files…", "Confirm"], ["src/retry.ts"]);
-	assert.match(h.statuses.at(-1)!, / model driving this slice /);
-	h.emit("session_tree");
-	assert.match(h.statuses.at(-1)!, preferring);
-	await h.settle();
-	// The slice is not restored, but what it did before the change is still reported for review: here, nothing.
-	assert.equal(h.messages.filter((message) => /driving again/.test(message.message.content)).length, 2);
-	assert.match(h.messages.at(-1).message.content, /driving again\. No files changed\./);
-
-	// A Confirm that lands after Stop grants nothing.
-	const count = turns();
+	// E5: a Confirm that lands after Stop grants nothing.
+	await h.turn("Add retry.");
 	let release!: (value: string) => void;
 	let reached!: () => void;
-	const asked = new Promise<void>((resolve) => { reached = resolve; });
-	let step = 0;
-	const toType = ["src/retry.ts"];
-	h.ui.select = async (title, options) => title.startsWith("Pair tasks") ? options.find((option) => option.startsWith("Backoff"))
-		: title === "Task 1: Backoff" ? "Implement task"
-		: title.startsWith("Choose files") ? typeFiles(() => toType.length)(options)
-		: step++ === 0 ? "Choose files…" : (reached(), new Promise<string>((resolve) => { release = resolve; }));
-	h.answers(() => toType.shift());
-	const pending = h.command("pair:tasks");
-	await asked;
+	const opened = new Promise<void>((resolve) => { reached = resolve; });
+	const late = proposeFiles(h, ["src/retry.ts"], () => { reached(); return new Promise<string>((resolve) => { release = resolve; }); });
+	await opened;
 	await h.command("pair:exit");
 	release("Confirm");
-	await pending;
-	assert.equal(turns(), count);
+	await assert.rejects(late, /Pair changed while the developer was asked, so nothing was confirmed/);
+	assert.equal(h.gate("edit", { path: "src/retry.ts" }).block, true);
 	assert.equal(h.statuses.at(-1), undefined);
 });
 
-/** Each message's labels by schema name; "?" is a low-confidence answer, and anything not listed gets the quiet first label. */
-const scripted = (answers: Record<string, Record<string, string>>, hold?: (text: string) => Promise<void> | undefined): ClassifierFactory => async () => ({
-	classify: async (text: string, schema: any) => {
-		await hold?.(text);
-		const labels = Object.keys(schema.labels);
-		const choice = answers[text]?.[schema.name] ?? labels[0];
-		return { ...decision(labels.map((label) => choice !== "?" && label === choice ? 10 : 0), labels), tokens: 1, ms: 0 };
-	},
-	dispose: async () => {},
+test("pair_report hands a slice back: code returns to the task for review, and only the developer marks it done", async (t) => {
+	const h = harness(t);
+	await h.init(true);
+	approveAll(h);
+	h.ui.select = async (title, options) => title === "Pair" ? "Pair with spec" : title === "Pair with spec" ? "flow" : driving(title, options);
+	await h.command("pair");
+	// Implement task 1 with the model driving.
+	h.ui.select = async (title, options) => title.startsWith("Pair tasks") ? options.find((option) => option.startsWith("1. Backoff"))
+		: title === "Task 1: Backoff" ? "Implement task" : undefined;
+	await h.command("pair:tasks");
+	const report = (params: any) => h.tools.get("pair_report").execute("report", params, undefined, undefined, h.ctx);
+
+	// With an approved spec the tool is available; the model's contract tells it to report when the slice is done.
+	assert.ok(h.active().includes("pair_report"));
+	assert.match(pairContracts(h)[0], /call pair_report \(status implemented\)/);
+
+	// A report for another task is refused, and schedules no return.
+	await assert.rejects(report({ task: "2", status: "implemented", summary: "done" }), /implementing task 1, not 2/);
+
+	// The selected task: accepted, told to stop, and never marked done by the report.
+	assert.match(await said(report({ task: "1", status: "implemented", summary: "Added backoff; ran the tests." })), /Stop here: don't keep editing/);
+	assert.deepEqual(h.spec().state.tasks["1"], { agreedHash: h.hash("1"), completedHash: null });
+
+	// When the turn settles, the summary is announced and the task's actions open with Mark done first.
+	const offered: [string, string[]][] = [];
+	h.ui.select = async (title, options) => { offered.push([title, options]); return undefined; };
+	await h.settle();
+	assert.equal(h.messages.at(-1).message.content, "The model reports task 1: Backoff implemented: Added backoff; ran the tests.");
+	assert.deepEqual(offered.at(-1), ["Task 1: Backoff", ["Mark task as done", "Implement task", "Implement task + prompt", "Cancel"]]);
+	assert.deepEqual(h.spec().state.tasks["1"], { agreedHash: h.hash("1"), completedHash: null });
+
+	// A blocked report returns the same way, but offers Implement + prompt first.
+	offered.length = 0;
+	await said(report({ task: "1", status: "blocked", summary: "The client API is missing." }));
+	await h.settle();
+	assert.deepEqual(offered.at(-1), ["Task 1: Backoff", ["Implement task + prompt", "Implement task", "Mark task as done", "Cancel"]]);
+
+	// A report for a task that is already done is refused, and leaves the completion as the developer set it.
+	writeState(stateFile(h.file), { ...h.spec().state, tasks: { ...h.spec().state.tasks, "1": { agreedHash: h.hash("1"), completedHash: h.hash("1") } } });
+	await assert.rejects(report({ task: "1", status: "implemented", summary: "done" }), /Task 1 is already done/);
+
+	// With the spec reopened for editing there is no task list to return to, so the tool refuses. (A refresh updates the cached ready flag, as a real reopen does.)
+	writeState(stateFile(h.file), { ...h.spec().state, tasks: { ...h.spec().state.tasks, "1": { agreedHash: h.hash("1"), completedHash: null } }, specAgreed: false });
+	await h.emit("before_agent_start", { systemPrompt: "base" });
+	await assert.rejects(report({ task: "1", status: "implemented", summary: "done" }), /no task to report on here/);
 });
+
 const user = (text: string) => ({ role: "user", content: [{ type: "text", text }], timestamp: 0 });
-/** The Pair contracts on one model call, parsed. */
-const pairContracts = (h: ReturnType<typeof harness>) => h.context().filter((message: any) => message.customType === CONTRACT)
-	.map((message: any) => JSON.parse(message.content.slice(message.content.indexOf("{"), message.content.lastIndexOf("}") + 1)));
-/** Drive the file browser: while paths remain to type, pick "Type a path\u2026"; once none remain, save with C-c C-c. */
-const typeFiles = (remaining: () => number) => (options: string[]) =>
-	remaining() > 0 ? options.find((o) => o.startsWith("Type")) : "\x06";
-const pairNoSpec = async (h: ReturnType<typeof harness>, preset = "Guide me") => {
-	h.ui.select = async (title, options) => title === "Pair" ? "Pair no spec" : options.find((option) => option.startsWith(preset));
+/** The Pair contracts on one model call, as text. */
+const pairContracts = (h: ReturnType<typeof harness>): string[] => h.context().filter((message: any) => message.customType === CONTRACT)
+	.map((message: any) => message.content);
+const requestOf = (contract: string) => Number(contract.match(/^Request (\d+);/m)![1]);
+/** The text a Pair tool answered with. */
+const said = async (result: Promise<any>) => (await result).content[0].text;
+/** The model proposes PATHS with pair_files; the developer answers with ANSWER, or ANSWER decides from the dialog's title. */
+const proposeFiles = (h: ReturnType<typeof harness>, paths: string[], answer: string | undefined | ((title: string) => Promise<string | undefined>) = "Confirm") => {
+	h.ui.select = async (title) => typeof answer === "function" ? answer(title) : title.startsWith("The model proposes to change") ? answer : undefined;
+	return h.tools.get("pair_files").execute("files", { files: paths.map((path) => ({ path, why: "Add retry." })) }, undefined, undefined, h.ctx);
+};
+/** The model proposes a profile change with pair_profile. */
+const proposeProfile = (h: ReturnType<typeof harness>, params: Record<string, string>) =>
+	h.tools.get("pair_profile").execute("profile", params, undefined, undefined, h.ctx);
+const pairNoSpec = async (h: ReturnType<typeof harness>, answer = guided) => {
+	h.ui.select = async (title, options) => title === "Pair" ? "Pair no spec" : answer(title, options);
 	await h.command("pair");
 };
 
-test("each Pair request is resolved once and served with one fresh contract; a slice is its own, and new words pause it", async (t) => {
-	const h = harness(t, undefined, scripted({
-		"Add retry to the client.": { pair_request: "implement" },
-		"Wait, I'll write the rest myself.": { pair_request: "implement", pair_driver: "human" },
-		"Show the solution, but I will type it.": { pair_request: "implement", pair_driver: "human", pair_help: "solution" },
-	}));
-	await pairNoSpec(h, "Drive and review");
-	const titles: string[] = [];
-	const choices = ["Choose files…", "Confirm"];
-	const toType = ["src/client.ts"];
-	h.ui.select = async (title, options) => title.startsWith("Choose files") ? typeFiles(() => toType.length)(options)
-		: (titles.push(title), choices.shift());
-	h.answers(() => toType.shift());
+test("each Pair request is served one fresh contract from the live profile; new words end its files (D1), and a profile change applies within the turn", async (t) => {
+	const h = harness(t);
+	await pairNoSpec(h, driving);
 	await h.turn("Add retry to the client.");
-	// No spec: the developer's words are the behaviour, and the files are theirs to name.
-	assert.match(titles[0], /^Hand this request to the model\?\n.*\nBehaviour: Add retry to the client\.\nFiles: none yet/s);
-	const [slice] = pairContracts(h);
-	assert.deepEqual([slice.driver, slice.files, slice.developerSaid, slice.developerWants], ["model", ["src/client.ts"], "Add retry to the client.", "implement"]);
+	await proposeFiles(h, ["src/client.ts"]);
+	const [first] = pairContracts(h);
+	assert.match(first, /^Pair request contract\nRequest \d+; this contract is for this request only\.\nProfile: model drives · solution · after a slice\.\nConfirmed files: src\/client\.ts\.\n/);
 	// A tool continuation is another model call for the same request: still exactly one contract, the same one.
-	assert.deepEqual(pairContracts(h).map((contract: any) => contract.request), [slice.request]);
-	assert.match(h.statuses.at(-1)!, / model driving this slice · solution$/);
+	assert.deepEqual(pairContracts(h), [first]);
 
-	// New words pause the slice before they are even classified, and the next request inherits nothing.
+	// D1: the developer's next words end the files before Pi even delivers them, and the next request starts with none.
 	const steer = h.emit("input", { text: "Wait, I'll write the rest myself.", source: "rpc", streamingBehavior: "steer" });
-	assert.match(h.gate("edit").reason, /^Changes are paused: The developer sent another message/);
+	assert.match(h.gate("edit", { path: "src/client.ts" }).reason, /^Changes are paused: The developer sent another message/);
+	for (const name of ["bash", ...WEB_TOOLS]) assert.match(h.gate(name).reason, /^Changes are paused:/);
+	assert.ok(!h.active().includes("bash"));
 	await steer;
 	h.deliver(user("Wait, I'll write the rest myself."));
+	assert.equal(h.gate("bash", { command: "ls" }), undefined);
+	assert.ok(h.active().includes("bash"));
 	const [steered] = pairContracts(h);
-	assert.deepEqual([steered.driver, steered.files, steered.developerSaid], ["human", undefined, "Wait, I'll write the rest myself."]);
-	assert.equal(titles.length, 2); // No slice offered for it.
+	assert.equal(requestOf(steered), requestOf(first) + 1);
+	assert.match(steered, /^No files confirmed yet\.$/m);
+	// E2: their words for this turn win over the profile, which stays as it was.
+	assert.match(steered, /Their words for this turn win over the profile, within what the tools allow: if they say not to edit yet, don't\./);
+	assert.match(h.statuses.at(-1)!, / Pair · model driving · after a slice$/);
+	await h.settle();
 
-	// E1: the solution, typed by the developer, for this request only; the default is untouched.
-	await h.turn("Show the solution, but I will type it.");
-	const [solution] = pairContracts(h);
-	assert.deepEqual([solution.driver, solution.assistance, solution.defaults.assistance], ["human", "solution", "solution"]);
-	assert.equal(titles.length, 2);
+	// The model proposes the developer driving; Submit applies it to this same request: the contract and the tools, now.
+	await h.turn("Show me the solution; I'll type it.");
+	const [asked] = pairContracts(h);
+	h.ui.select = async (title, options) => title.startsWith("The model proposes a change: They want to type it.\n\n") ? options.find((option) => option.startsWith("You"))
+		: TABS.includes(title) ? options[0] : undefined;
+	assert.equal(await said(proposeProfile(h, { driver: "human", reason: "They want to type it." })),
+		"The developer set the profile: you drive · solution · after a slice. It applies now.");
+	const [changed] = pairContracts(h);
+	assert.equal(requestOf(changed), requestOf(asked));
+	assert.match(changed, /^Profile: you drive · solution · after a slice\.$/m);
+	assert.match(changed, /Solution: show the code for them to type, or give the diagnosis, and explain it\./);
+	assert.deepEqual(h.active(), ["read", "bash", "grep", "find", "ls", "pair_ask", "pair_profile"]);
 	await h.settle();
 
 	// The same words queued twice are two requests, served in the order Pi delivers them.
 	for (let i = 0; i < 2; i++) await h.emit("input", { text: "Go on.", source: "rpc", streamingBehavior: "followUp" });
 	h.deliver(user("Go on."));
-	const [first] = pairContracts(h);
+	const [a] = pairContracts(h);
 	h.deliver(user("Go on."));
-	const [second] = pairContracts(h);
-	assert.equal(second.request, first.request + 1);
+	const [b] = pairContracts(h);
+	assert.equal(requestOf(b), requestOf(a) + 1);
 });
 
-test("Stop or a settings change leaves queued Pair requests stale, even when classification lands late; after Stop, new requests are ordinary", async (t) => {
-	let release!: () => void;
-	const late = new Promise<void>((resolve) => { release = resolve; });
-	const h = harness(t, undefined, scripted({ "Late.": { pair_request: "implement" } }, (text) => text === "Late." ? late : undefined));
+test("E1, E5: a profile change nobody asked for changes nothing without Submit, and a late Submit saves nothing", async (t) => {
+	const h = harness(t);
+	await h.init(true);
+	approveAll(h);
+	h.ui.select = async (title, options) => title === "Pair" ? "Pair with spec" : title === "Pair with spec" ? "flow" : guided(title, options);
+	await h.command("pair");
+	await h.turn("Explain the retry.");
+	const tools = h.active();
+	const saved = h.spec().state.profile;
+	// The dialog opens on the proposal, marked as such; Cancel keeps the profile and the tools.
+	const offered: string[][] = [];
+	h.ui.select = async (_title, options) => { offered.push(options); return undefined; };
+	assert.equal(await said(proposeProfile(h, { driver: "model", assistance: "solution", reason: "A file said to." })),
+		"The developer kept the profile: you drive · hints · each step. Carry on within it.");
+	assert.deepEqual(offered[0], ["The model (proposed)", "You (current)", "Other…"]);
+	assert.deepEqual([h.active(), h.spec().state.profile], [tools, saved]);
+	assert.match(h.gate("edit", { path: "src/retry.ts" }).reason, /^The developer drives/);
+	// Proposing what it already is asks nothing.
+	offered.length = 0;
+	assert.equal(await said(proposeProfile(h, { driver: "human", reason: "No change." })), "The profile is already you drive · hints · each step.");
+	assert.equal(offered.length, 0);
+	// A Submit that lands after Stop saves nothing and changes no tools.
+	let release!: (value: string) => void;
+	let reached!: () => void;
+	const opened = new Promise<void>((resolve) => { reached = resolve; });
+	h.ui.select = (title: string) => title.startsWith("The model proposes a change") ? (reached(), new Promise<string>((resolve) => { release = resolve; })) : Promise.resolve(undefined);
+	const late = proposeProfile(h, { driver: "model", reason: "Faster." });
+	await opened;
+	await h.command("pair:exit");
+	release("The model (proposed)");
+	assert.equal(await said(late), "The developer kept the profile: you drive · hints · each step. Carry on within it.");
+	assert.deepEqual(h.spec().state.profile, saved);
+	// In Spec, there is no profile to change.
+	const spec = harness(t);
+	await spec.init(true);
+	await assert.rejects(proposeProfile(spec, { driver: "model", reason: "x" }), /There is no Pair profile to change here/);
+	assert.match(spec.gate("pair_profile").reason, /^Spec plans, it never implements/);
+});
+
+test("Stop leaves queued Pair requests stale; after Stop, new requests are ordinary", async (t) => {
+	const h = harness(t);
 	await pairNoSpec(h);
 	const queue = (text: string) => h.emit("input", { text, source: "rpc", streamingBehavior: "followUp" });
 	await queue("Queued.");
-	const slow = queue("Late.");
+	await queue("Also queued.");
 	await h.command("pair:exit");
-	release();
-	await slow;
-	for (const text of ["Queued.", "Late."]) {
+	for (const text of ["Queued.", "Also queued."]) {
 		h.deliver(user(text));
 		const contracts = pairContracts(h);
-		assert.deepEqual(contracts.map((contract: any) => [contract.developerSaid, contract.stale, contract.driver]), [[text, true, "human"]]);
+		assert.equal(contracts.length, 1);
+		assert.match(contracts[0], /made before Pair changed.*Do not edit files or run commands/s);
 		assert.match(h.gate("edit").reason, /made before Pair changed/);
-		assert.equal(h.gate("bash").block, true);
+		for (const name of ["bash", ...WEB_TOOLS]) assert.match(h.gate(name).reason, /made before Pair changed/);
+		assert.ok(!h.active().includes("bash"));
+		assert.equal(h.gate("pair_files").block, true);
 		assert.equal(h.gate("read"), undefined);
 	}
 	// A genuinely new request after Stop is ordinary Pi: no contract, and Pair does not gate it.
@@ -872,66 +996,8 @@ test("Stop or a settings change leaves queued Pair requests stale, even when cla
 	h.deliver(user("Ordinary."));
 	assert.equal(pairContracts(h).length, 0);
 	assert.equal(h.gate("edit"), undefined);
-
-	// A settings change does the same to what was queued under the old settings.
-	await pairNoSpec(h);
-	await queue("Queued again.");
-	h.ui.select = async (_title, options) => options.find((option) => option.startsWith("Build together"));
-	await h.command("pair:settings");
-	h.deliver(user("Queued again."));
-	const [contract] = pairContracts(h);
-	assert.equal(contract.stale, true);
-	assert.match(h.gate("write").reason, /made before Pair changed/);
-});
-
-test("without the classifier, a model preference asks before any edit, showing the developer's own words; cancelling leaves them driving", async (t) => {
-	const h = harness(t, undefined, async () => { throw new Error("ONNX Runtime is unavailable"); });
-	await h.init(true);
-	approveAll(h);
-	h.ui.select = async (title, options) => title === "Pair" ? "Pair with spec" : title === "Pair with spec" ? "flow"
-		: title.startsWith("Pair settings") ? options.find((option) => option.startsWith("Drive and review")) : undefined;
-	await h.command("pair");
-	const offered: string[] = [];
-	h.ui.select = async (title) => { offered.push(title); return undefined; };
-	const long = `${"Please change the retry loop. ".repeat(600)}But don't edit anything yet.`;
-	for (const text of [long, "Implement it."]) {
-		offered.length = 0;
-		await h.turn(text);
-		// The dialog shows the whole message, "don't edit" included; cancelling it grants nothing.
-		assert.equal(offered.length, 1);
-		assert.ok(offered[0].startsWith("Hand this request to the model?\n") && offered[0].includes(`\nBehaviour: ${text}\nFiles: `));
-		const [contract] = pairContracts(h);
-		assert.deepEqual([contract.developerSaid, contract.driver, contract.task, "files" in contract], [text, "human", "1: Backoff", false]);
-		assert.match(h.gate("edit").reason, /^The developer drives this request/);
-	}
-	assert.equal(h.notices.filter((notice) => /Local triage model unavailable/.test(notice)).length, 1);
-	assert.equal(h.factoryCalls(), 1);
-
-	// A task start needs no classification: the slice is offered and confirmed.
-	const pickTask = (action: string, choices: string[], left: () => number = () => 0) => {
-		offered.length = 0;
-		h.ui.select = async (title, options) => title.startsWith("Pair tasks") ? options.find((option) => option.startsWith("Backoff"))
-			: title === "Task 1: Backoff" ? action
-			: title.startsWith("Choose files") ? typeFiles(left)(options)
-			: (offered.push(title), choices.shift());
-		return h.command("pair:tasks");
-	};
-	const toType = ["src/retry.ts"];
-	h.answers(() => toType.shift());
-	await pickTask("Implement task", ["Choose files…", "Confirm"], () => toType.length);
-	assert.match(offered[0], /^Hand task 1: Backoff to the model\?/);
-	const [slice] = pairContracts(h);
-	assert.deepEqual([slice.driver, slice.files, slice.task], ["model", ["src/retry.ts"], "1: Backoff"]);
-	assert.match(slice.developerSaid, /^Implement task 1: Backoff from /);
-	await h.settle();
-	assert.equal(h.spec().state.tasks["1"].completedHash, null); // A finished slice is reviewed, never marked done by Pair.
-	// Added words that cannot be classified are shown in the dialog; declining a task start sends nothing.
-	const sent = h.messages.length;
-	h.answers(() => "Don't edit yet.");
-	await pickTask("Implement task + prompt", []);
-	assert.equal(offered.length, 1);
-	assert.match(offered[0], /\nBehaviour: Retry\.\n\nDon't edit yet\.\nFiles: /);
-	assert.equal(h.messages.length, sent);
+	assert.equal(h.gate("bash"), undefined);
+	assert.deepEqual(h.active(), ["read", "bash", "write", "edit", "external"]);
 });
 
 test("an approved spec reopened by hand while pairing is Spec again for the next delivered request", async (t) => {
@@ -939,7 +1005,7 @@ test("an approved spec reopened by hand while pairing is Spec again for the next
 	await h.init(true);
 	approveAll(h);
 	h.ui.select = async (title, options) => title === "Pair" ? "Pair with spec" : title === "Pair with spec" ? "flow"
-		: title.startsWith("Pair settings") ? options[0] : undefined;
+		: guided(title, options);
 	await h.command("pair");
 	await h.emit("input", { text: "Carry on.", source: "rpc", streamingBehavior: "followUp" });
 	writeState(stateFile(h.file), { ...h.spec().state, specAgreed: false });
@@ -962,24 +1028,29 @@ const read = (h: ReturnType<typeof harness>, path: string) => readFileSync(join(
 const editRetries = (h: ReturnType<typeof harness>, path = "src/client.ts", from = "0", to = "3", signal?: AbortSignal) =>
 	run(h, "edit", { path, edits: [{ oldText: from, newText: to }] }, signal);
 
-test("while the developer drives, the model reads, asks and shows only: by gate, by exposure and at the write itself", async (t) => {
+test("while the developer drives, the model can inspect and run commands, but edit/write stay guarded", async (t) => {
 	const h = harness(t);
 	files(h, { "src/client.ts": "let retries = 0;\n" });
 	await pairNoSpec(h);
-	assert.deepEqual(h.active(), ["read", "pair_ask"]); // bash, write, edit and another extension's tool are not offered.
+	assert.deepEqual(h.active(), ["read", "bash", "grep", "find", "ls", "pair_ask", "pair_profile"]);
 	await h.turn("Explain the client.");
-	for (const name of ["edit", "write", "bash", "powershell", "external", "subagent", "pair_write"]) assert.equal(h.gate(name, { path: "src/client.ts" }).block, true, name);
-	for (const name of ["read", "grep", "find", "ls", "pair_ask"]) assert.equal(h.gate(name, { path: "src/client.ts" }), undefined, name);
-	assert.match(h.gate("bash").reason, /bash is not available\. Suggest a command for the developer to run instead\.$/);
-	// A call that got past every gate still writes nothing.
-	await assert.rejects(editRetries(h), /The developer drives this request.*Nothing was written/);
-	await assert.rejects(run(h, "write", { path: "src/new.ts", content: "x" }), /The developer drives this request/);
+	for (const name of ["edit", "write", "powershell", "external", "subagent", "pair_write", "pair_files"]) assert.equal(h.gate(name, { path: "src/client.ts" }).block, true, name);
+	for (const name of ["read", "grep", "find", "ls", "pair_ask", "pair_profile"]) assert.equal(h.gate(name, { path: "src/client.ts" }), undefined, name);
+	assert.equal(h.gate("bash", { command: "git diff" }), undefined);
+	await assert.rejects(proposeFiles(h, ["src/client.ts"]), /^Error: The developer drives: suggest the change for them to make, or propose the model driving with pair_profile\.$/);
+	// An edit/write call that got past every gate still writes nothing.
+	await assert.rejects(editRetries(h), /The developer drives: suggest the change.*Nothing was written/);
+	await assert.rejects(run(h, "write", { path: "src/new.ts", content: "x" }), /The developer drives: suggest the change/);
 	assert.equal(read(h, "src/client.ts"), "let retries = 0;\n");
 	assert.equal(existsSync(join(h.cwd, "src/new.ts")), false);
-	// A name proves nothing: a read another extension has taken over is not Pi's read.
-	h.foreign.add("read");
-	assert.match(h.gate("read").reason, /read is provided by an extension here, not by Pi/);
-	h.foreign.delete("read");
+	// A name proves nothing: replacements for Pi's discovery tools and shell are not offered or allowed.
+	for (const name of ["read", "grep", "find", "ls", "bash"]) h.foreign.add(name);
+	await h.turn("Inspect the client.");
+	for (const name of h.foreign) {
+		assert.match(h.gate(name).reason, /is provided by an extension here, not by Pi/);
+		assert.ok(!h.active().includes(name), name);
+	}
+	h.foreign.clear();
 	// Stop gives back exactly the developer's own tools once the request is over, and edit is Pi's edit again.
 	await h.command("pair:exit");
 	assert.equal(h.gate("edit").block, true); // The stopped request is still being served.
@@ -990,53 +1061,31 @@ test("while the developer drives, the model reads, asks and shows only: by gate,
 	assert.equal(read(h, "src/client.ts"), "let retries = 3;\n");
 });
 
-/** Pair no spec, Drive and review, and a confirmed slice of FILES for "Add retry.". */
+/** Pair no spec, the model driving, and FILES proposed and confirmed for "Add retry.". */
 async function slice(h: ReturnType<typeof harness>, files: string[]) {
-	await pairNoSpec(h, "Drive and review");
-	const toType = [...files];
-	h.ui.select = async (title, options) => title.startsWith("Choose files") ? typeFiles(() => toType.length)(options)
-		: toType.length ? "Choose files…" : "Confirm";
-	h.answers(() => toType.shift());
+	await pairNoSpec(h, driving);
 	await h.turn("Add retry.");
+	await proposeFiles(h, files);
 }
-const implementing = scripted({ "Add retry.": { pair_request: "implement" } });
-
-test("the file browser walks directories, toggles files and adds a whole folder without typing paths", async (t) => {
-	const h = harness(t, undefined, implementing);
-	files(h, { "src/client.ts": "x\n", "src/util.ts": "y\n", "docs/readme.md": "z\n" });
-	await pairNoSpec(h, "Drive and review");
-	// Descend into src/ (→), tick every file in it, untick one, then confirm — no path typed.
-	const clicks = ["src/", "all", "client.ts", "SAVE"];
-	h.ui.select = async (title, options) => {
-		if (!title.startsWith("Choose files")) return clicks.length ? "Choose files\u2026" : "Confirm";
-		const click = clicks.shift()!;
-		if (click === "SAVE") return "\x06"; // C-c C-c: the only way to save and move on.
-		const label = options.find((o) => o.includes(click))!;
-		return click === "src/" ? `\x1d${label}` : `\x1e${label}`; // → descends into the folder; SPC ticks the rest.
-	};
-	await h.turn("Add retry.");
-	const [slice] = pairContracts(h);
-	assert.deepEqual(slice.files, ["src/util.ts"]);
-	assert.deepEqual(h.active(), ["read", "write", "edit", "pair_ask"]);
-	await h.settle();
-});
 
 test("a confirmed slice writes only its files, through Pi's own edit and write, and never over the developer's work", async (t) => {
-	const h = harness(t, undefined, implementing);
+	const h = harness(t, undefined);
 	files(h, { "src/client.ts": "let retries = 0;\n", "src/other.ts": "other\n" });
 	symlinkSync(join(h.cwd, "src/other.ts"), join(h.cwd, "src/alias.ts"));
-	// A preference is not a grant: before a slice is confirmed nothing that edits is offered or allowed.
-	await pairNoSpec(h, "Drive and review");
-	assert.deepEqual(h.active(), ["read", "pair_ask"]);
+	// The profile is not an edit/write grant: inspection is available before files are confirmed.
+	await pairNoSpec(h, driving);
+	await h.turn("Add retry.");
+	assert.deepEqual(h.active(), ["read", "bash", "grep", "find", "ls", "pair_ask", "pair_profile", "pair_files"]);
+	assert.equal(h.gate("bash", { command: "ls src" }), undefined);
 	assert.equal(h.gate("edit", { path: "src/client.ts" }).block, true);
-	await slice(h, ["src", "src/client.ts src/new.ts"]);
-	assert.match(h.notices.at(-1)!, /src is not a file/); // A directory is never confirmed.
-	assert.deepEqual(h.active(), ["read", "write", "edit", "pair_ask"]);
+	await assert.rejects(proposeFiles(h, ["src"]), /src is not a file/); // A directory is never confirmed.
+	await proposeFiles(h, ["src/client.ts", "src/new.ts"]);
+	assert.deepEqual(h.active(), ["read", "bash", "write", "edit", "grep", "find", "ls", "pair_ask", "pair_profile", "pair_files"]);
 	await editRetries(h);
 	assert.equal(read(h, "src/client.ts"), "let retries = 3;\n");
 	// Anything else is refused at the gate and again at the write.
 	for (const path of ["src/other.ts", "src/alias.ts"]) {
-		assert.match(h.gate("edit", { path }).reason, /is not a file confirmed for this slice/);
+		assert.match(h.gate("edit", { path }).reason, /is not a file confirmed for this slice \(src\/client\.ts, src\/new\.ts\)\. Nothing was written; propose it with pair_files first\./);
 		await assert.rejects(editRetries(h, path, "other", "mine"), /is not a file confirmed for this slice/);
 	}
 	assert.equal(read(h, "src/other.ts"), "other\n");
@@ -1045,7 +1094,7 @@ test("a confirmed slice writes only its files, through Pi's own edit and write, 
 	await assert.rejects(run(h, "write", { path: "src/client.ts", content: "replaced\n" }), /already exists and write only creates new files/);
 	await run(h, "write", { path: "src/new.ts", content: "export {};\n" });
 	await run(h, "write", { path: "src/new.ts", content: "export const retry = 3;\n" }); // Its own new file.
-	assert.match(h.gate("bash").reason, /bash is not available/); // No shell, even while the model drives.
+	assert.equal(h.gate("bash", { command: "git diff" }), undefined);
 	h.foreign.add("edit");
 	assert.match(h.gate("edit", { path: "src/client.ts" }).reason, /edit is provided by another extension here, so Pair cannot check its writes/);
 	h.foreign.delete("edit");
@@ -1056,12 +1105,12 @@ test("a confirmed slice writes only its files, through Pi's own edit and write, 
 	// Review: before and final versions of each confirmed file that differs, and the tools narrow again.
 	await h.settle();
 	// The developer's later edit to client.ts is flagged, not attributed to the model.
-	assert.match(h.messages.at(-1).message.content, /driving again\. Changed: src\/client\.ts lines 1-1, src\/new\.ts \(new\) lines 1-1; each span encloses every change in its file and may include unchanged lines\. src\/client\.ts changed again after the model's last write; that later change is not the model's\. Pair ran no checks\./);
+	assert.match(h.messages.at(-1).message.content, /files are closed\. Changed: src\/client\.ts lines 1-1, src\/new\.ts \(new\) lines 1-1; each span encloses every change in its file and may include unchanged lines\. src\/client\.ts changed again after the model's last write; that later change is not the model's\. Review the changes and any check results above;/);
 	assert.deepEqual(h.messages.at(-1).message.details.review.files, [
 		{ path: "src/client.ts", before: "let retries = 0;\n", after: "let retries = 3;\n", span: { start_line: 1, end_line: 1 }, changedSince: true },
 		{ path: "src/new.ts", before: null, after: "export const retry = 3;\n", span: { start_line: 1, end_line: 1 }, changedSince: false }]);
 	assert.equal(h.messages.at(-1).message.details.review.partial, false);
-	assert.deepEqual(h.active(), ["read", "pair_ask"]);
+	assert.deepEqual(h.active(), ["read", "bash", "grep", "find", "ls", "pair_ask", "pair_profile", "pair_files"]);
 	await assert.rejects(editRetries(h, "src/client.ts", "5", "9"), /Nothing was written/);
 });
 
@@ -1069,7 +1118,7 @@ test("unsaved or uncheckable editor buffers block a slice's writes; an abort or 
 	const saved = (paths: string[], modified = false) => ({ ok: true, buffers: paths.map((path) => ({ path, open: true, modified })) });
 	// No buffer_state, or no editor at all although one is configured: nothing can be checked, so nothing is written.
 	for (const capabilities of [[], undefined]) {
-		const h = harness(t, (method) => method === "handshake" ? capabilities && { version: 1, editor: "test", capabilities } : undefined, implementing);
+		const h = harness(t, (method) => method === "handshake" ? capabilities && { version: 1, editor: "test", capabilities } : undefined);
 		h.start();
 		files(h, { "src/client.ts": "let retries = 0;\n" });
 		await slice(h, ["src/client.ts"]);
@@ -1078,7 +1127,7 @@ test("unsaved or uncheckable editor buffers block a slice's writes; an abort or 
 		assert.equal(read(h, "src/client.ts"), "let retries = 0;\n");
 	}
 	let reply: (paths: string[]) => unknown = (paths) => saved(paths);
-	const h = harness(t, (method, args) => method === "handshake" ? { version: 1, editor: "test", capabilities: ["buffer_state"] } : reply(args.paths), implementing);
+	const h = harness(t, (method, args) => method === "handshake" ? { version: 1, editor: "test", capabilities: ["buffer_state"] } : reply(args.paths));
 	h.start();
 	files(h, { "src/client.ts": "let retries = 0;\n" });
 	await slice(h, ["src/client.ts"]);
@@ -1118,10 +1167,10 @@ test("unsaved or uncheckable editor buffers block a slice's writes; an abort or 
 test("a slice's notes go only on lines it changed; its hand-back names the real spans and says when it was cut short", async (t) => {
 	const saved = (paths: string[]) => ({ ok: true, buffers: paths.map((path) => ({ path, open: true, modified: false })) });
 	const h = harness(t, (method, args) => method === "handshake" ? { version: 1, editor: "test", capabilities: ["show", "present", "buffer_state"] }
-		: saved(args.paths), implementing);
+		: saved(args.paths));
 	h.start();
 	files(h, { "src/client.ts": "one\ntwo\nthree\nfour\n", "src/old.ts": "gone\n", "src/other.ts": "other\n" });
-	await slice(h, ["src/client.ts src/old.ts src/new.ts"]);
+	await slice(h, ["src/client.ts", "src/old.ts", "src/new.ts"]);
 	const note = (path: string, start_line: number, end_line = start_line) =>
 		h.gate("pair_show_code", { mode: "annotate", ranges: [{ path, start_line, end_line, note: "Why it changed." }] });
 	assert.match(note("src/client.ts", 2).reason, /^Notes on this slice go only on lines it changed \(none yet\)/);
@@ -1139,13 +1188,27 @@ test("a slice's notes go only on lines it changed; its hand-back names the real 
 	// The developer types mid-slice: it pauses, and the hand-back says what changed, where, and that it may be partial.
 	await h.emit("input", { text: "Wait.", source: "rpc", streamingBehavior: "steer" });
 	await h.settle();
-	assert.equal(h.messages.at(-1).message.content, "The model's slice is finished, and you are driving again. "
+	assert.equal(h.messages.at(-1).message.content, "The model's slice is finished, and its files are closed. "
 		+ "Changed: src/client.ts lines 2-4, src/old.ts (emptied), src/new.ts (new) lines 1-1; each span encloses every change in its file and may include unchanged lines. "
-		+ "The slice was interrupted, so its changes may be partial. Pair ran no checks. Review it; another slice needs a new confirmation.");
+		+ "The slice was interrupted, so its changes may be partial. Review the changes and any check results above; further changes need files confirmed again.");
 	assert.equal(h.messages.at(-1).message.details.review.partial, true);
 	assert.deepEqual(h.messages.at(-1).message.details.review.files.map((file: any) => [file.path, file.span]),
 		[["src/client.ts", { start_line: 2, end_line: 4 }], ["src/old.ts", null], ["src/new.ts", { start_line: 1, end_line: 1 }]]);
 	// Driving again: notes are the developer's guidance and may go anywhere.
 	await h.turn("Explain the client.");
 	assert.equal(note("src/other.ts", 1), undefined);
+});
+
+/** A slice confirmed, then the developer takes the keyboard back in the profile: no grant outlives it. */
+test("choosing to drive in the profile pauses a live slice at once", async (t) => {
+	const h = harness(t, undefined);
+	files(h, { "src/client.ts": "let retries = 0;\n" });
+	await slice(h, ["src/client.ts"]);
+	h.ui.select = async (title, options) => guided(title, options);
+	await h.command("pair:profile");
+	assert.match(h.gate("edit", { path: "src/client.ts" }).reason, /^Changes are paused: The developer is driving now\./);
+	assert.match(h.gate("bash").reason, /^Changes are paused: The developer is driving now\./);
+	assert.ok(!h.active().includes("bash"));
+	await assert.rejects(editRetries(h), /Changes are paused: The developer is driving now/);
+	assert.equal(read(h, "src/client.ts"), "let retries = 0;\n");
 });

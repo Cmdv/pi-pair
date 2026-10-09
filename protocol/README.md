@@ -78,24 +78,29 @@ The core's `pair_show_code` tool needs `show` for its `show` mode and
 resolved-project-boundary rules. Open the actual file at line 1 without taking
 chat keyboard focus. Refresh a visiting buffer only if it has no unsaved changes;
 never revert a modified buffer. No highlighting or scratch representation is
-required. Acknowledge only after opening. The core uses this capability after
-the initial description and after explicit proposal approval.
+required. Acknowledge only after opening. The core uses this capability
+whenever it shows the task list or opens a task, so the spec stays in view.
 
 ## Buffer state
 
-`buffer_state` accepts `{"paths":["docs/plan.md"]}`: unique project-relative
-paths under the same rules. Reply with one entry per path, in request order:
+`buffer_state` accepts `{"paths":["docs/plan.md"]}`: unique paths, each
+project-relative under the same rules, or absolute for a confirmed file outside
+the project under a root the developer approved for the spec. Reply with one
+entry per path, in request order:
 `{"ok":true,"buffers":[{"path":"docs/plan.md","open":true,"modified":true}]}`.
 `open` means the editor has a buffer for the file; `modified` means that
 buffer has unsaved changes. Never open, save or change a buffer to answer.
 A path with no buffer, including one for a missing file, is closed and
-unmodified. Reject the whole request if any path is invalid or resolves
-outside the project.
+unmodified. Reject the whole request if any path is invalid, or if a
+project-relative path resolves outside the project.
 
 The core checks the active spec and companion state before every write and
-before approval. Modified buffers, unavailable capability on a connected editor,
-failed requests or malformed replies block the write. The model cannot edit
-either file directly.
+before approval, and each confirmed file just before a model `edit` or `write`
+lands. Modified buffers, unavailable capability on a connected editor, failed
+requests or malformed replies block the write. The model cannot edit the spec
+or its state directly. While pairing, the core also asks after the model reads
+a project file: if its buffer is modified, or the editor cannot say, the model
+is told it read the saved file. That never blocks the read.
 
 ## Pair controls and presentation
 
@@ -103,8 +108,21 @@ No new wire envelope is needed for controls. Core status key `pair` identifies
 active Pair/Spec and the selected task; removing it restores ordinary Pi styling.
 Widget `pi-pair` lists contextual slash commands on one line. `/pair:approve`
 appears only when there is something to approve, `/pair:tasks` when tasks exist,
-and `/pair:exit` while Pair is active. Frontends may bind keys to these commands,
-preserving an existing composer draft. The backend remains authoritative.
+`/pair:profile` while pairing (not in Spec), and `/pair:exit` while Pair is
+active. Frontends may bind keys to these commands, preserving an existing
+composer draft. The backend remains authoritative.
+
+While pairing, the `pair` status ends with who drives and what applies to them
+(`you drive · hints`, `model driving · after a slice`), then `N files
+confirmed`, `confirm files` or `review` while they apply. Show it as text:
+colour alone must not say who has control, and at narrow widths keep this part
+and shorten the spec and task part first.
+
+The profile dialog is an ordinary `ask` with three questions whose options are
+marked `(current)` or `(proposed)`. The model's proposed files, and a Spec write
+outside the task under review, are ordinary `select` dialogs whose title lists
+what would change. None of these answers grants anything the core has not
+validated, and a cancelled or late answer grants nothing.
 Visible `customType: "pi-pair"` messages carry full prompt/save/handoff text;
 render them prominently and persistently, tinted apart from the developer's own. Never display `display: false`
 contracts. Control actions are not inferred from conversational replies.
@@ -115,8 +133,9 @@ contracts. Control actions are not inferred from conversational replies.
 one to five questions, each with a short tab label and zero to five options.
 With no options the developer types an answer; `pair_ask` still requires two
 or more options for model-generated questions.
-The first option is the model's recommendation and arrives labelled as such;
-show the options in the order given.  Show a tab per question and a final
+The first option is the model's recommendation and arrives labelled
+`(recommended)`, unless it is already marked `(current)` or `(proposed)`, as in
+the core's profile dialog; show the options in the order given.  Show a tab per question and a final
 Submit tab; the developer moves between them freely, picks an option or types
 their own (`Other…`), and may skip questions.  With one question, answering it submits.  Reply once they submit
 or cancel, in request order, `null` for each skipped question:

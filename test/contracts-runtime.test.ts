@@ -27,7 +27,7 @@ test("real Pi carries one live contract, blocks effects, writes only through pai
 	const settingsManager = SettingsManager.inMemory({ compaction: { enabled: false }, retry: { enabled: false } });
 	const resourceLoader = new DefaultResourceLoader({ cwd, agentDir, settingsManager, noExtensions: true, noSkills: true,
 		noPromptTemplates: true, noThemes: true, agentsFilesOverride: () => ({ agentsFiles: [] }), extensionFactories: [(pi) => {
-			pair(pi, async () => { throw new Error("The linear flow must not load a classifier"); });
+			pair(pi);
 			contractModel(pi, async (messages, signal) => {
 				requests.push(structuredClone(messages));
 				const once = attempt;
